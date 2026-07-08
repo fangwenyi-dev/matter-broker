@@ -1,0 +1,14 @@
+# ESP32-S3-WROOM-1-N16R8 分区表
+# 16MB Quad SPI Flash
+# OTA 双分区方案：ota_0/ota_1 各 6MB，配合 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+# P1-B 修复：删除 factory 分区（原 3.75MB < 固件实际大小会导致出厂烧录失败），
+#           OTA 双分区 + 回滚保护已足够，factory 非必需
+# Name,   Type, SubType, Offset,    Size,     Flags
+nvs,      data, nvs,     0x10000,   0xC000,
+nvs_keys, data, nvs_keys,,           0x1000,  encrypted
+otadata,  data, ota,     ,           0x2000,
+phy_init, data, phy,     ,           0x1000,
+ota_0,    app,  ota_0,   0x20000,   0x600000,
+ota_1,    app,  ota_1,   0x620000,  0x600000,
+fctry,    data, nvs,     0xC20000,  0x10000,
+coredump, data, coredump,0xC30000,  0x10000,

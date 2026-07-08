@@ -1,0 +1,11 @@
+dependencies:
+  espressif/sock_utils:
+    version: ^0.2
+  idf: '>=5.1'
+description: The component provides a simple ESP32 port of mosquitto broker
+repository: git://github.com/espressif/esp-protocols.git
+repository_info:
+  commit_sha: dbccace49c1fa65bb474365e5a7ec59e0821d38c
+  path: components/mosquitto
+url: https://github.com/espressif/esp-protocols/tree/master/components/mosquitto
+version: 2.0.20~7

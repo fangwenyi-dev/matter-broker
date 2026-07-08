@@ -1,0 +1,130 @@
+# ============================================================
+# ESP32-S3-WROOM-1-N16R8 Matter-MQTT Broker 默认配置
+# 16MB Quad Flash + 8MB Octal PSRAM
+# 参考：esp-matter zigbee_bridge sdkconfig.defaults
+# ============================================================
+
+# ==================== 芯片与 Flash ====================
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+
+# ==================== PSRAM (8MB Octal) ====================
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# 小于该阈值的 malloc 走内部 RAM。原 16384 过大导致大量小分配挤占内部 RAM，
+# 降至 4096 让更多动态分配走 PSRAM（DMA 等必须内部的分配不受影响）
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ==================== BLE (Matter 配网) ====================
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
+CONFIG_BT_NIMBLE_ACL_BUF_SIZE=255
+# 内存优化：NimBLE host 内存池（MSYS/ACL/EVT）走 PSRAM，避免内部 RAM 耗尽
+# 导致 BLE_INIT: Malloc failed（原 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y）
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+# Matter 配网仅需 1 个 BLE 连接（手机直连），降低连接上下文内存占用
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# 内存优化：禁用 NimBLE 内置的标准 BLE 服务（Matter 不使用）
+# Matter 仅使用自定义 CHIPoBLE GATT 服务，不需要这些标准服务
+# 禁用后节省 2-5KB 代码 + 数据段空间
+CONFIG_BT_NIMBLE_PROX_SERVICE=n        # Proximity Service
+CONFIG_BT_NIMBLE_ANS_SERVICE=n         # Alert Notification Service
+CONFIG_BT_NIMBLE_CTS_SERVICE=n         # Current Time Service
+CONFIG_BT_NIMBLE_HTP_SERVICE=n         # Health Thermometer Service
+CONFIG_BT_NIMBLE_IPSS_SERVICE=n        # Internet Protocol Support Service
+CONFIG_BT_NIMBLE_TPS_SERVICE=n         # TX Power Service
+CONFIG_BT_NIMBLE_IAS_SERVICE=n         # Immediate Alert Service
+CONFIG_BT_NIMBLE_LLS_SERVICE=n         # Link Loss Service
+CONFIG_BT_NIMBLE_SPS_SERVICE=n         # Scan Parameters Service
+CONFIG_BT_NIMBLE_HR_SERVICE=n          # Heart Rate Service
+CONFIG_BT_NIMBLE_BAS_SERVICE=n         # Battery Service
+CONFIG_BT_NIMBLE_DIS_SERVICE=n         # Device Information Service（Matter 不依赖）
+
+# ==================== Wi-Fi ====================
+CONFIG_ESP_WIFI_ENABLED=y
+# 禁用 softAP（项目使用 BLE 配网，softAP 会误导用户连接无用热点）
+# 参考 esp-matter light example 的 sdkconfig.defaults
+CONFIG_ENABLE_WIFI_AP=n              # chip 层：禁用 ConnectivityManager 的 AP 模式
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n     # IDF 层：从编译层面移除 softAP 代码
+# WiFi RX BA 窗口保持 16（官方建议：启用 SPIRAM_TRY_ALLOCATE_WIFI_LWIP 时最小为 16）
+# 确保与各种 AP 的兼容性和 Matter OTA 吞吐量
+
+# ==================== lwIP (Matter 需要 IPv6) ====================
+# 注意：IGMP 和组播发送在 ESP-IDF v5.5.4 中由 lwipopts.h 硬编码启用
+# (LWIP_IGMP=1, LWIP_MULTICAST_TX_OPTIONS 自动派生)，无需在 Kconfig 中配置
+# espressif/mdns 依赖 igmp_joingroup_netif() 加入组播组 224.0.0.251
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
+CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
+CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
+
+# ==================== Matter ====================
+CONFIG_ENABLE_CHIP_SHELL=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_ENABLE_OTA_REQUESTOR=y
+CONFIG_SUPPORT_GROUPCAST_CLUSTER=n
+CONFIG_ESP_MATTER_CONSOLE_TASK_STACK=3072
+# 设为 n：使用 espressif/mdns 单实例，负责 Matter DNS-SD + matter-broker.local A 查询
+# 避免 minimal mdns 与 espressif/mdns 抢占 UDP 5353 端口导致 Matter 服务发布失败
+# ESP32DnssdImpl.cpp L162-165 的 mdns_hostname_set(MAC_hex) 已注释，避免覆盖 "matter-broker"
+CONFIG_USE_MINIMAL_MDNS=n
+
+# 项23: 提升 Matter/mDNS 任务优先级，避免被 broker/protocol_bridge 等任务抢占
+# 原默认 1（最低）：CASE 会话建立和订阅通知延迟，配合 WiFi 省电丢包导致 App 离线
+# Matter 提到 5（高于业务任务，低于 WiFi/lwIP 系统任务）
+# mDNS 提到 3（低于 Matter，避免 DNS 洪泛影响 CASE 握手）
+# 注意：不影响 broker 稳定性（broker priority=10 仍最高），仅提升 App/mDNS 响应速度
+CONFIG_CHIP_TASK_PRIORITY=5
+CONFIG_MDNS_TASK_PRIORITY=3
+
+# ==================== mbedTLS 内存优化（内部 RAM 优化核心） ====================
+# mbedTLS 改用 PSRAM 分配：CASE 会话（每个 20KB+）、证书解析等走 PSRAM
+# 原配置 INTERNAL_MEM_ALLOC 会占用 20-80KB 内部 RAM（最多 4 个 CASE 会话）
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=n
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# 启用动态缓冲区：TLS 握手后释放 16KB 入站 + 4KB 出站缓冲区
+# 握手期间临时分配，握手完成后释放，大幅减少常驻内部 RAM 占用
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# ==================== OTA 安全 ====================
+# 启用 OTA 回滚保护：新固件启动失败时自动回滚到上一版本，防止变砖
+# main.cpp 中 esp_ota_mark_app_valid_cancel_rollback() 依赖此配置生效
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ==================== Mosquitto Broker ====================
+# 启用 $SYS 主题，可通过 MQTT 客户端订阅 $SYS/# 远程查看 broker 状态
+# （客户端数、消息数、heap 占用等）
+CONFIG_MOSQ_ENABLE_SYS=y
+
+# ==================== FreeRTOS ====================
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY=y
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# ==================== 系统栈 ====================
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
+
+# ==================== 看门狗（禁用空闲任务检查，Matter 可能阻塞） ====================
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# ==================== 分区表 ====================
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ==================== 编译优化 ====================
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_CCACHE_ENABLE=y  # 启用编译缓存，加速重新编译
+
+# ==================== 日志 ====================
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_COLORS=y

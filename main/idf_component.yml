@@ -1,0 +1,11 @@
+# main 组件依赖声明
+# 通过 ESP Component Registry 拉取 esp_matter 和 mosquitto
+# 注意：esp_matter 必须锁定到 v1.5.0，main 分支与 IDF v5.5.4 的 GCC 14.2 存在
+# Nullable.h 编译兼容性问题（ClosureControl cluster 的 std::optional operator== 缺失）
+dependencies:
+  espressif/esp_matter:
+    version: '1.5.0'
+  espressif/mosquitto:
+    version: '^2.0.20'
+  espressif/cjson:
+    version: '^1.7.19'

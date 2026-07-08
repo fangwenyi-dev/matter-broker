@@ -1,0 +1,68 @@
+# Matter-MQTT Broker 项目配置
+menu "Matter-MQTT Broker Configuration"
+
+    config BROKER_PORT
+        int "MQTT Broker 监听端口"
+        default 1883
+        help
+            mosquitto broker 监听的 TCP 端口。
+            LoRa 网关和本地客户端通过此端口连接。
+
+    config MQTT_BROKER_HOST
+        string "本地 MQTT 客户端连接地址"
+        default "127.0.0.1"
+        help
+            ESP32 内部的 MQTT 客户端连接的 broker 地址。
+            本地客户端连接到本地 broker，使用 127.0.0.1。
+            
+            注意：LoRa 网关需要连接到 ESP32 的局域网 IP（WiFi 连接后获得），
+            不是这个配置项。
+
+    config MQTT_BROKER_USERNAME
+        string "MQTT Broker 用户名"
+        default "admin"
+        help
+            MQTT 连接认证用户名。
+            警告：默认 admin/admin 为弱密码，broker 监听 0.0.0.0 暴露在局域网，
+            生产部署务必修改为强密码。
+
+    config MQTT_BROKER_PASSWORD
+        string "MQTT Broker 密码"
+        default "admin"
+        help
+            MQTT 连接认证密码。
+            警告：默认 admin/admin 为弱密码，broker 监听 0.0.0.0 暴露在局域网，
+            生产部署务必修改为强密码。
+
+    config GATEWAY_SN
+        string "桥接器网关序列号"
+        default "MATTER_BRIDGE_001"
+        help
+            本桥接器的网关序列号（SN），用于 $SH MQTT 协议。
+            MQTT 主题格式为 gateway/{GATEWAY_SN}/req。
+
+config MAX_BRIDGED_DEVICES
+    int "最大桥接设备数"
+    default 12
+    range 1 12
+    help
+            Matter Bridge 支持的最大虚拟端点数量。
+            每个开窗器子设备创建 1 个 Matter 端点（含 WindowCovering +
+            PowerSource 电池 + BDI 认证信息），电池和状态传感器作为
+            cluster 内嵌在端点中，不额外占用端点配额。
+            每个端点约占 1.5-2KB 内部 RAM，12 个约 18-24KB。
+
+    config BUTTON_GPIO
+        int "按键 GPIO 编号"
+        default 0
+        help
+            按键连接的 GPIO 编号（低电平有效，需上拉）。
+            默认 GPIO0（ESP32-S3 DevKit 的 BOOT 按钮）。
+
+            按键功能：
+            - 2击：启动 LoRa 配对模式
+            - 3击：删除所有 LoRa 子设备
+            - 5击：仅重置 Matter（不重置 WiFi）
+            - 长按 5 秒：仅清除 WiFi 凭证（不重置 Matter）
+
+endmenu

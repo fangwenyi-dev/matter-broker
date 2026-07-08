@@ -1,0 +1,10 @@
+{
+  "name": "mosquitto",
+  "version-string": "2.0.20",
+  "dependencies": [
+    "cjson",
+    "libwebsockets",
+    "openssl",
+    "pthreads"
+  ]
+}

@@ -1,0 +1,11 @@
+dependencies:
+  espressif/mosquitto:
+    version: '*'
+  espressif/mqtt:
+    rules:
+    - if: idf_version >=6.0
+      version: ^1.0.0
+  espressif/sock_utils:
+    version: '*'
+  protocol_examples_common:
+    path: ${IDF_PATH}/examples/common_components/protocol_examples_common

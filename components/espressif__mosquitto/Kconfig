@@ -1,0 +1,23 @@
+menu "Mosquitto"
+
+    config MOSQ_IS_ENABLED
+        # Invisible option that is enabled if MOSQ is added to the IDF components.
+        # This is used to "select" CONFIG_ESP_TLS_SERVER option (needed for TLS connection)
+        # (these are optionally used in mosq)
+        bool
+        default "y"
+        select ESP_TLS_SERVER
+
+    config MOSQ_ENABLE_SYS
+        bool "Enable $SYS topics"
+        default n
+        help
+            Enable the $SYS topics for the broker
+
+    config MOSQ_SYS_UPDATE_INTERVAL
+        int "Update interval for the SYS topic"
+        default 10
+        depends on MOSQ_ENABLE_SYS
+        help
+            Time in seconds for the update of the $SYS topics for the broker
+endmenu

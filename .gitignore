@@ -1,0 +1,34 @@
+# Build output
+build/
+build_*/
+
+# ESP-IDF managed components (auto-downloaded via idf_component.yml)
+managed_components/
+
+# SDK config (generated from sdkconfig.defaults)
+sdkconfig
+sdkconfig.old
+
+# Cache
+.cache/
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+build_log*.txt
+
+# Binary artifacts
+*.bin
+*.elf
+*.map
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Flash tool
+.uploads/
