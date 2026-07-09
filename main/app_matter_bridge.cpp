@@ -37,6 +37,7 @@
 #include <app/reporting/reporting.h>
 #include <lib/core/TLVReader.h>
 #include <platform/PlatformManager.h>
+#include <app-common/zap-generated/attributes/Accessors.h>
 #include <string.h>
 
 // Descriptor cluster ID 和 PartsList attribute ID（Matter 规范）
@@ -959,16 +960,20 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     //    渲染的关键属性。
 
     // 7a. 强制重设 FeatureMap（Lift+PALift+Tilt+PATilt = 0x17）
-    //     FeatureMap 是 ATTRIBUTE_FLAG_NONE（非 NONVOLATILE），理论上不会被覆盖。
-    //     但 HomeKit 通过 FeatureMap 判断是否支持 Tilt 能力，若 Tilt/PATilt 位
-    //     丢失则不渲染 Tilt 滑块，故强制重设作为保险。
-    esp_matter_attr_val_t fm_val = esp_matter_bitmap32(
-        WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT |
-        WC_FEATURE_TILT | WC_FEATURE_POSITION_AWARE_TILT);
-    esp_err_t fm_err = attribute::update(ep_id, WindowCovering::Id,
-                                          ATTR_FEATURE_MAP, &fm_val);
-    if (fm_err != ESP_OK) {
-        ESP_LOGW(TAG, "更新 FeatureMap 失败: ep=%u err=%s", ep_id, esp_err_to_name(fm_err));
+    //     关键修复：esp-matter 的 attribute::update() 只更新 esp-matter 存储，
+    //     不更新 connectedhomeip 的 ember RAM 存储。而 DataModelProvider::ReadAttribute
+    //     读取 FeatureMap 时从 ember RAM 存储读取（因为 WindowCoverAttrAccess::Read
+    //     不处理 FeatureMap，且 WindowCovering 没有 ServerClusterInterface 集成文件）。
+    //     结果：ember RAM 存储中的 FeatureMap 是 ZAP 默认值（0x0005=Lift+PALift），
+    //     缺少 Tilt(0x02) 和 PositionAwareTilt(0x10) 位，HomeKit 不渲染 Tilt 滑块。
+    //     修复：使用 connectedhomeip 的 Attributes::FeatureMap::Set() 直接写入 ember RAM 存储。
+    uint32_t desired_feature_map = WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT |
+                                   WC_FEATURE_TILT | WC_FEATURE_POSITION_AWARE_TILT;
+    auto fm_status = chip::app::Clusters::WindowCovering::Attributes::FeatureMap::Set(ep_id, desired_feature_map);
+    if (fm_status != chip::Protocols::InteractionModel::Status::Success) {
+        ESP_LOGW(TAG, "更新 FeatureMap(ember) 失败: ep=%u status=0x%02X", ep_id, (uint8_t)fm_status);
+    } else {
+        ESP_LOGI(TAG, "FeatureMap(ember) 已设置: ep=%u val=0x%04lX", ep_id, desired_feature_map);
     }
 
     // 7b. 强制重设 ConfigStatus（NONVOLATILE，会被 NVS 旧值覆盖）

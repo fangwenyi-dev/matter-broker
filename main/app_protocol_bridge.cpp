@@ -1101,21 +1101,29 @@ static void handle_ctype_003(const char *gw_sn, cJSON *data, int msg_id)
         }
         // StackLock 已释放，清理映射表不需要 Matter API
         // 清理设备→网关映射表条目，防止映射表空间泄漏
+        bool map_cleaned = false;
+        char cleaned_gw_sn[32] = {0};
         taskENTER_CRITICAL(&s_device_map_lock);
         for (int i = 0; i < MAX_DEVICE_ENTRIES; i++) {
             if (s_device_gateway_map[i].in_use &&
                 strcmp(s_device_gateway_map[i].device_sn, dev_sn) == 0) {
                 s_device_gateway_map[i].in_use = false;
                 s_device_gateway_map[i].device_sn[0] = '\0';
+                strncpy(cleaned_gw_sn, s_device_gateway_map[i].gateway_sn, sizeof(cleaned_gw_sn) - 1);
                 s_device_gateway_map[i].gateway_sn[0] = '\0';
                 s_device_gateway_map[i].voltage_mv = 0;
                 s_device_gateway_map[i].state = 0;
                 s_device_gateway_map[i].add_seq = 0;
-                ESP_LOGI(TAG, "已清理设备映射: dev=%s gw=%s", dev_sn, gw_sn);
+                map_cleaned = true;
                 break;
             }
         }
         taskEXIT_CRITICAL(&s_device_map_lock);
+        // P-Crash1 修复：ESP_LOGI 不能在 taskENTER_CRITICAL 临界区内调用！
+        // vprintf 需要获取 newlib 递归锁，临界区关闭调度器导致死锁 → abort()
+        if (map_cleaned) {
+            ESP_LOGI(TAG, "已清理设备映射: dev=%s gw=%s", dev_sn, cleaned_gw_sn[0] ? cleaned_gw_sn : gw_sn);
+        }
     } else {
         // 配对成功：添加 Matter 端点
         ESP_LOGI(TAG, "设备配对成功: gw=%s dev=%s", gw_sn, dev_sn);
