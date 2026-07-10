@@ -65,4 +65,15 @@ config MAX_BRIDGED_DEVICES
             - 5击：仅重置 Matter（不重置 WiFi）
             - 长按 5 秒：仅清除 WiFi 凭证（不重置 Matter）
 
+    config LED_GPIO
+        int "WS2812 幻彩 LED GPIO"
+        default 48
+        help
+            WS2812 5050 幻彩 LED 数据线连接的 GPIO 编号。
+            单颗 RGB LED，通过 RMT 驱动，按优先级显示蓝/绿/红三色：
+            - 蓝色：WiFi/Matter 状态（慢闪=等待连接，快闪=重置中，常亮2s=连接成功）
+            - 绿色：LoRa 通信状态（快闪=配对中，单闪=MQTT消息收发）
+            - 红色：删除操作（快闪3s=正在删除所有子设备）
+            设为 -1 可禁用 LED。
+
 endmenu

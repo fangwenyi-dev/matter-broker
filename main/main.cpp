@@ -39,6 +39,7 @@
 #include "app_matter_bridge.h"
 #include "app_protocol_bridge.h"
 #include "app_button.h"
+#include "app_led.h"
 #include "mdns.h"   // mDNS：设置 matter-broker.local hostname
 
 static const char *TAG = "main";
@@ -60,10 +61,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi 已连接，IP: " IPSTR, IP2STR(&event->ip_info.ip));
+ESP_LOGI(TAG, "WiFi 已连接，IP: " IPSTR, IP2STR(&event->ip_info.ip));
 
-        // 项10: 连接成功，重置重连计数
-        s_wifi_retry_count = 0;
+// 蓝灯常亮2秒后熄灭（WiFi 连接成功指示）
+app_led_set(LED_BLUE, LED_MODE_ON, 2000);
+
+// 项10: 连接成功，重置重连计数
+s_wifi_retry_count = 0;
 
         // 项23: 禁用 WiFi 省电模式（WIFI_PS_NONE），保持射频常开。
         //       原因：IDF 默认 WIFI_PS_MIN_MODEM 会在 beacon 间隙关闭接收机，
@@ -309,7 +313,18 @@ extern "C" void app_main(void)
     // 若新固件有 WiFi/LoRa bug 已标记 valid 无法回滚。
     // 移到 WiFi 连接成功后标记，至少验证 WiFi 协议栈正常。
 
-    // 9. 初始化按键（GPIO0，低电平有效）—— 非关键模块
+    // 9. 初始化 LED 指示灯模块（WS2812 幻彩 LED）
+    //    蓝灯慢闪表示 WiFi 等待连接，WiFi 连接成功后蓝灯常亮2s
+    esp_err_t led_err = app_led_init(CONFIG_LED_GPIO);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "LED 初始化失败: %s，继续运行（指示灯不可用）", esp_err_to_name(led_err));
+    } else {
+        // 启动时蓝灯慢闪，等待 WiFi 连接
+        app_led_set(LED_BLUE, LED_MODE_SLOW_BLINK, 0);
+        ESP_LOGI(TAG, "LED 指示灯已初始化");
+    }
+
+    // 10. 初始化按键（GPIO0，低电平有效）—— 非关键模块
     //    项17: 降级处理，失败时仅警告并继续运行（设备作为 broker 仍可工作，只是按键不可用）
     esp_err_t btn_err = app_button_init(CONFIG_BUTTON_GPIO);
     if (btn_err != ESP_OK) {

@@ -12,6 +12,7 @@
  */
 #include "app_protocol_bridge.h"
 #include "app_matter_bridge.h"
+#include "app_led.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
@@ -467,12 +468,14 @@ static void publish_mqtt_json(const char *topic, const char *json_str, const cha
             ESP_LOGW(TAG, "MQTT 客户端未连接，%s进 outbox 延迟发送: topic=%s", log_label, topic);
         }
         int rc = esp_mqtt_client_publish(client, topic, json_str, data_len, 1, 0);
-        if (rc < 0) {
-            // 返回值 <0 表示发布失败（客户端未连接/outbox 满等）。
-            ESP_LOGW(TAG, "发布失败(rc=%d)，%s丢失: topic=%s", rc, log_label, topic);
-        } else {
-            ESP_LOGD(TAG, "发布%s: topic=%s payload=%s", log_label, topic, json_str);
-        }
+if (rc < 0) {
+// 返回值 <0 表示发布失败（客户端未连接/outbox 满等）。
+ESP_LOGW(TAG, "发布失败(rc=%d)，%s丢失: topic=%s", rc, log_label, topic);
+} else {
+ESP_LOGD(TAG, "发布%s: topic=%s payload=%s", log_label, topic, json_str);
+// 绿灯单闪：ESP → LoRa 网关消息
+app_led_flash(LED_GREEN);
+}
     }
 }
 
@@ -1149,6 +1152,8 @@ static void handle_ctype_003(const char *gw_sn, cJSON *data, int msg_id)
     } else {
         // 配对成功：添加 Matter 端点
         ESP_LOGI(TAG, "设备配对成功: gw=%s dev=%s", gw_sn, dev_sn);
+        // 配对成功，关闭绿灯（停止快闪）
+        app_led_off(LED_GREEN);
         register_device_gateway(dev_sn, gw_sn);
 
         char dev_name[64];
@@ -1385,6 +1390,9 @@ static void handle_mqtt_message(const mqtt_message_t *msg)
     }
 
     ESP_LOGD(TAG, "收到 MQTT: topic=%s data=%.*s", msg->topic, msg->data_len, msg->data);
+
+    // 绿灯单闪：LoRa 网关 → ESP 消息
+    app_led_flash(LED_GREEN);
 
     // 解析 JSON
     cJSON *root = cJSON_ParseWithLength(msg->data, msg->data_len);
@@ -1898,7 +1906,15 @@ void app_protocol_bridge_delete_all_devices(void)
     taskEXIT_CRITICAL(&s_device_map_lock);
 
     if (dev_count == 0) {
-        ESP_LOGW(TAG, "没有可删除的子设备");
+        ESP_LOGW(TAG, "映射表中没有子设备，检查是否有残留 Matter 端点...");
+        // 重启后映射表为空，但 Matter 端点持久化在 NVS 中
+        // 直接从 Matter node 枚举并移除所有桥接端点
+        int matter_removed = app_matter_bridge_remove_all_devices();
+        if (matter_removed > 0) {
+            ESP_LOGI(TAG, "已清理 %d 个残留 Matter 端点", matter_removed);
+        } else {
+            ESP_LOGI(TAG, "没有可删除的子设备");
+        }
         return;
     }
 
@@ -1933,5 +1949,12 @@ void app_protocol_bridge_delete_all_devices(void)
         ESP_LOGI(TAG, "兜底清理完成: 强制移除 %d 个设备", cleanup_count);
     } else {
         ESP_LOGI(TAG, "所有设备已通过003响应正常移除");
+    }
+
+    // 最终扫描：清理可能残留的 Matter 端点（重启后 NVS 中遗留的端点）
+    // 即使映射表中的设备已全部移除，Matter node 中可能仍有未追踪的端点
+    int final_sweep = app_matter_bridge_remove_all_devices();
+    if (final_sweep > 0) {
+        ESP_LOGI(TAG, "最终扫描: 清理 %d 个残留端点", final_sweep);
     }
 }

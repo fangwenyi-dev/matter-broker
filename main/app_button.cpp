@@ -18,6 +18,7 @@
  * - 长按5秒操作用于仅清除WiFi，不重置Matter
  */
 #include "app_button.h"
+#include "app_led.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
@@ -68,6 +69,8 @@ static bool s_initialized = false;
 static void action_lora_pairing(void)
 {
     ESP_LOGI(TAG, ">>> 动作: 启动 LoRa 配对模式 <<<");
+    // 绿灯快闪，配对成功或8秒超时后熄灭
+    app_led_set(LED_GREEN, LED_MODE_FAST_BLINK, 8000);
     app_protocol_bridge_start_pairing();
 }
 
@@ -80,6 +83,8 @@ static void action_lora_pairing(void)
 static void action_delete_all_devices(void)
 {
     ESP_LOGI(TAG, ">>> 动作: 删除所有 LoRa 子设备 <<<");
+    // 红灯快闪3秒
+    app_led_set(LED_RED, LED_MODE_FAST_BLINK, 3000);
     app_protocol_bridge_delete_all_devices();
 }
 
@@ -98,6 +103,8 @@ static void action_delete_all_devices(void)
 static void action_reset_matter(void)
 {
     ESP_LOGI(TAG, ">>> 动作: 仅重置 Matter（5击）<<<");
+    // 蓝灯快闪（持续到重启）
+    app_led_set(LED_BLUE, LED_MODE_FAST_BLINK, 0);
 
     // P1-3 修复：factory_reset 是 Matter API，调用时必须持有 StackLock，
     // 否则与 Matter 事件循环并发可能触发 chipDie abort。
@@ -139,6 +146,8 @@ static void action_reset_matter(void)
 static void action_reset_wifi(void)
 {
     ESP_LOGI(TAG, ">>> 动作: 仅清除 WiFi 凭证（长按 5s）<<<");
+    // 蓝灯慢闪（持续到重启，重启后 WiFi 连接成功时蓝灯常亮2s）
+    app_led_set(LED_BLUE, LED_MODE_SLOW_BLINK, 0);
 
     // 打开 NVS 命名空间，清除 WiFi 凭证
     nvs_handle_t nvs_handle;

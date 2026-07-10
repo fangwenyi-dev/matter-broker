@@ -86,6 +86,18 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
 esp_err_t app_matter_bridge_remove_device(uint16_t endpoint_id);
 
 /**
+ * @brief 移除所有桥接子设备端点
+ *
+ * 枚举 Matter node 下所有端点（跳过 root 和 aggregator），
+ * 逐个禁用并销毁。用于"3击删除所有子设备"功能。
+ * 重启后 s_device_table 为空但 Matter 端点持久化在 NVS 中，
+ * 此函数直接从 Matter node 枚举端点，确保彻底清理。
+ *
+ * @return 移除的端点数量
+ */
+int app_matter_bridge_remove_all_devices(void);
+
+/**
  * @brief 更新 Matter WindowCovering 位置（MQTT→Matter 方向）
  *
  * 将 LoRa 位置（0=关闭, 100=打开）反转为 Matter 百分比（0%=打开, 100%=关闭）

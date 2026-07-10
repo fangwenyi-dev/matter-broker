@@ -39,7 +39,6 @@
 #include <platform/PlatformManager.h>
 #include <string.h>
 #include <app-common/zap-generated/cluster-objects.h>
-#include <app/clusters/mode-select-server/supported-modes-manager.h>
 
 // Descriptor cluster ID 和 PartsList attribute ID（Matter 规范）
 // 用于在 CASE Session 建立后通知控制器重新读取 PartsList，发现新端点
@@ -82,41 +81,27 @@ static const char *TAG = "app_matter_bridge";
 #define ATTR_INSTALLED_OPEN_LIMIT_TILT     0x0012   // InstalledOpenLimitTilt (uint16)
 #define ATTR_INSTALLED_CLOSED_LIMIT_TILT   0x0013   // InstalledClosedLimitTilt (uint16)
 
-// ModeSelect cluster（Matter 规范 cluster ID = 0x0050）
-#define MODE_SELECT_CLUSTER_ID            0x0050
-#define ATTR_MODE_SELECT_CURRENT_MODE     0x0001   // CurrentMode (uint8)
+// OnOff cluster（Matter 规范 cluster ID = 0x0006）
+#define ON_OFF_CLUSTER_ID             0x0006
+#define ATTR_ON_OFF                    0x0000   // OnOff attribute (bool)
 
 // WindowCovering feature flags（参见 SDK Enums.h）
-// bit0=Lift, bit1=Tilt, bit2=PositionAwareLift, bit4=PositionAwareTilt
+// bit0=Lift, bit2=PositionAwareLift（仅升降，无 Tilt）
 #define WC_FEATURE_LIFT                 0x01
-#define WC_FEATURE_TILT                 0x02
 #define WC_FEATURE_POSITION_AWARE_LIFT  0x04
-#define WC_FEATURE_POSITION_AWARE_TILT  0x10
 
 // Type 枚举值（参见 SDK Enums.h Type enum）
-// Type 描述窗覆产品的物理运动方式，影响控制器 UI 渲染：
-//   0x00=RollerShade（仅升降）, 0x08=TiltBlindLiftAndTilt（升降+倾斜）
-// 开窗器推动窗扇升降开合(Lift) + 内倒(Tilt)，必须使用 LiftAndTilt 类型。
-// 原 0x00 (RollerShade) 导致 HomeKit 不渲染 Tilt 滑块（RollerShade 无 Tilt 能力）。
-// 改为 0x08 (TiltBlindLiftAndTilt) 后 HomeKit 渲染 Lift + Tilt 双滑块。
-// 参考 Matter 规范 Enums.h Type 枚举。
-#define WC_TYPE_LIFT_AND_TILT         0x08   // 升降+倾斜型（开窗器：升降开合+内倒）
+// 0x00=RollerShade（仅升降），用于开窗器升降控制
+// 内倒功能通过 OnOff cluster 实现（独立开关按钮），不再依赖 Tilt feature
+#define WC_TYPE_LIFT                    0x00   // RollerShade（仅升降）
 
-// EndProductType 枚举值（Matter 规范 Enums.h，共 25 个值）
-// 规范枚举全部为遮阳/窗帘/百叶类产品（RollerShade/RomanShade/PleatedShade/InteriorBlind 等），
-// 无"Window/开窗器"对应值。
-// P1-6 修复：原值 0xFF (Unknown) 导致 HomeKit 回退到二态 UI（仅开/关按钮），不渲染位置滑块。
-// P-Tilt1 修复：0x00 (RollerShade) 虽然渲染 Lift 滑块，但 RollerShade 无 Tilt 能力，
-// HomeKit 不渲染 Tilt 滑块，导致用户拖动 Lift 滑块发送的是位置控制值(0-100)而非内倒命令(200)。
-// 改为 0x0A (InteriorBlind)，InteriorBlind 同时支持 Lift + Tilt，
-// HomeKit 渲染 Lift 滑块 + Tilt 滑块 + 开/关/停止按钮。
-// 参考 Matter 规范 7.3.4.2 EndProductType 枚举。
-#define WC_END_PRODUCT_TYPE_WINDOW    0x0A   // InteriorBlind（室内百叶，支持升降+倾斜）
+// EndProductType 枚举值（Matter 规范 Enums.h）
+// 0x00=RollerShade，仅渲染 Lift 滑块 + 开/关/停止按钮
+#define WC_END_PRODUCT_TYPE_WINDOW      0x00   // RollerShade（仅升降）
 
-// ConfigStatus 位（Matter 规范 Enums.h：bit3=LiftPositionAware, bit4=TiltPositionAware）
+// ConfigStatus 位（Matter 规范 Enums.h：bit3=LiftPositionAware）
 #define WC_CONFIG_STATUS_OPERATIONAL          0x01
 #define WC_CONFIG_STATUS_LIFT_POSITION_AWARE  0x08
-#define WC_CONFIG_STATUS_TILT_POSITION_AWARE  0x10
 
 // 内部状态
 static QueueHandle_t s_event_queue = NULL;
@@ -140,7 +125,10 @@ typedef struct {
     // 端点刚创建标志（per-feature 独立）：跳过 SDK 默认 delegate 触发的首次属性变更
     // Lift 和 Tilt 各自独立，避免 Lift 先触发清除后 Tilt 首次变更不被跳过导致意外内倒
     bool just_added_lift;  // 跳过首次 TargetPositionLiftPercent100ths 变更
-    bool just_added_tilt;  // 跳过首次 TargetPositionTiltPercent100ths 变更
+    // 模式选择端点 ID（独立 bridged_node，OnOff 开关：平开/内倒模式）
+    uint16_t mode_ep_id;
+    // 内倒 OnOff 自动重置标志：防止 auto-set-back 触发递归回调
+    volatile bool updating_onoff_niedao;
     // P2-3 修复：记录端点创建时间，just_added 标志在 2000ms 后自动失效
     // 防止 SDK 异步触发首次 PRE_UPDATE 时标志已被清除导致误发 LoRa 命令
     volatile int64_t added_time_us;
@@ -248,7 +236,8 @@ static void clear_device_entry(bridged_device_entry_t *entry)
     entry->endpoint_id = 0;
     entry->device_sn[0] = '\0';
     entry->just_added_lift = false;
-    entry->just_added_tilt = false;
+    entry->mode_ep_id = 0;
+    entry->updating_onoff_niedao = false;
     entry->updating_from_mqtt = false;
     entry->skip_next_target_update = false;
     entry->skip_target_update_time_us = 0;
@@ -329,9 +318,10 @@ static esp_err_t app_stop_motion_command_cb(const chip::app::ConcreteCommandPath
 /**
  * @brief 子设备内倒功能（LoRa value=200）
  *
- * 内倒功能通过 WindowCovering Tilt 滑块实现。
- * 用户拖动 Tilt 滑块触发 TargetPositionTiltPercent100ths 属性变更，
- * 在 app_attribute_update_cb 中处理并发送 LoRa value=200 内倒命令。
+ * 内倒功能通过 OnOff cluster 实现（开关式按钮）。
+ * 用户在 HomeKit 中点击内倒开关 → OnOff 属性变更为 true
+ * → POST_UPDATE 中发送 LoRa value=200 内倒命令
+ * → 自动重置为 false（开关表现为按钮：按一下触发内倒，然后自动弹回）
  */
 
 static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
@@ -342,63 +332,56 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
                                           void *priv_data)
 {
     if (type == attribute::POST_UPDATE) {
-        // POST_UPDATE: 属性值已写入，用于 Tilt null 重置（P-HomeKit2 修复）
-        // 在 PRE_UPDATE 中递归调用 attribute::update 会导致 null 被外层 set_val 覆盖，
-        // 且递归调用同一属性在架构上不安全。移到 POST_UPDATE 后，外层 set_val 已完成，
-        // 此处重置 null 可以正确持久化。
-        if (cluster_id == WindowCovering::Id &&
-            attribute_id == ATTR_TARGET_TILT_PERCENT_100THS) {
-            // 从设备表读取 updating_from_mqtt 标志
-            // P-Opt1 修复：用 found 标志替代指针比较，避免在临界区外使用 entry 指针
-            bool found = false;
-            bool from_mqtt = false;
+        // OnOff cluster - 内倒动作 (WindowCovering endpoint) 和 模式选择 (mode endpoint)
+        if (cluster_id == OnOff::Id && attribute_id == ATTR_ON_OFF) {
+            bool is_niedao = false;
+            bool is_mode = false;
+            char dev_sn[32] = {0};
+            bool onoff_val = (val != NULL) ? val->val.b : false;
+
             taskENTER_CRITICAL(&s_device_table_lock);
-            bridged_device_entry_t *e = find_by_endpoint(endpoint_id);
-            if (e != NULL) {
-                found = true;
-                from_mqtt = e->updating_from_mqtt;
+            for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
+                if (s_device_table[i].in_use) {
+                    if (s_device_table[i].endpoint_id == endpoint_id) {
+                        is_niedao = true;
+                        strncpy(dev_sn, s_device_table[i].device_sn, sizeof(dev_sn) - 1);
+                        break;
+                    }
+                    if (s_device_table[i].mode_ep_id == endpoint_id) {
+                        is_mode = true;
+                        strncpy(dev_sn, s_device_table[i].device_sn, sizeof(dev_sn) - 1);
+                        break;
+                    }
+                }
             }
             taskEXIT_CRITICAL(&s_device_table_lock);
 
-            // 非 MQTT 方向触发的变更需要重置
-            if (!found || from_mqtt) {
-                return ESP_OK;
+            if (is_niedao && onoff_val) {
+                // 内倒动作：OnOff 被打开 → 发送 LoRa 200
+                ESP_LOGI(TAG, "OnOff 内倒触发: ep=%u sn=%s → lora=200", endpoint_id, dev_sn);
+                push_matter_event(MATTER_EVENT_TILT_TOGGLE, endpoint_id, dev_sn, 200);
+
+                // 自动重置为 OFF（使开关表现为按钮：按一下触发内倒，然后自动弹回）
+                taskENTER_CRITICAL(&s_device_table_lock);
+                bridged_device_entry_t *e = find_by_endpoint(endpoint_id);
+                if (e != NULL) e->updating_onoff_niedao = true;
+                taskEXIT_CRITICAL(&s_device_table_lock);
+
+                esp_matter_attr_val_t off_val = esp_matter_bool(false);
+                attribute::update(endpoint_id, OnOff::Id, ATTR_ON_OFF, &off_val);
+
+                taskENTER_CRITICAL(&s_device_table_lock);
+                bridged_device_entry_t *e2 = find_by_endpoint(endpoint_id);
+                if (e2 != NULL) e2->updating_onoff_niedao = false;
+                taskEXIT_CRITICAL(&s_device_table_lock);
             }
-            // 重置 TargetTilt 为 null，使下次拖动到任意位置（含相同位置）都能触发 PRE_UPDATE
-            taskENTER_CRITICAL(&s_device_table_lock);
-            bridged_device_entry_t *e_reset = find_by_endpoint(endpoint_id);
-            if (e_reset != NULL) e_reset->updating_from_mqtt = true;
-            taskEXIT_CRITICAL(&s_device_table_lock);
-            esp_matter_attr_val_t null_tilt = esp_matter_nullable_uint16(nullable<uint16_t>());
-            esp_err_t reset_err = attribute::update(endpoint_id, WindowCovering::Id,
-                                                     ATTR_TARGET_TILT_PERCENT_100THS, &null_tilt);
-            if (reset_err != ESP_OK) {
-                ESP_LOGW(TAG, "重置 TargetTilt 为 null 失败: ep=%u err=%s",
-                         endpoint_id, esp_err_to_name(reset_err));
-            }
-            taskENTER_CRITICAL(&s_device_table_lock);
-            bridged_device_entry_t *e_clear = find_by_endpoint(endpoint_id);
-            if (e_clear != NULL) e_clear->updating_from_mqtt = false;
-            taskEXIT_CRITICAL(&s_device_table_lock);
-        }
-        // ModeSelect CurrentMode 变更 → 发送窗锁模式控制命令
-        // SDK 的 ChangeToMode 命令处理函数验证模式后直接 Set(CurrentMode)，
-        // POST_UPDATE 在属性写入后触发，此处发送 MQTT 命令。
-        // val->val.u8: 0=内开内倒模式, 1=平开模式
-        if (cluster_id == MODE_SELECT_CLUSTER_ID &&
-            attribute_id == ATTR_MODE_SELECT_CURRENT_MODE) {
-            char mode_sn[32] = {0};
-            taskENTER_CRITICAL(&s_device_table_lock);
-            bridged_device_entry_t *e = find_by_endpoint(endpoint_id);
-            if (e != NULL) {
-                strncpy(mode_sn, e->device_sn, sizeof(mode_sn) - 1);
-            }
-            taskEXIT_CRITICAL(&s_device_table_lock);
-            if (mode_sn[0] != '\0' && val != NULL) {
-                uint8_t mode_value = val->val.u8;
-                ESP_LOGI(TAG, "Matter 窗锁模式变更: ep=%u sn=%s mode=%u (0=内倒,1=平开)",
-                         endpoint_id, mode_sn, mode_value);
-                push_matter_event(MATTER_EVENT_MODE_CHANGED, endpoint_id, mode_sn, mode_value);
+
+            if (is_mode) {
+                // 模式选择：OnOff=true→平开(1), OnOff=false→内倒(0)
+                uint8_t mode_val = onoff_val ? 1 : 0;
+                ESP_LOGI(TAG, "OnOff 模式变更: ep=%u sn=%s mode=%u (0=内倒,1=平开)",
+                         endpoint_id, dev_sn, mode_val);
+                push_matter_event(MATTER_EVENT_MODE_CHANGED, endpoint_id, dev_sn, mode_val);
             }
         }
         return ESP_OK;
@@ -414,7 +397,6 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
     // - just_added_lift/tilt per-feature 独立标志，仅在对应分支内清除
     char device_sn[32] = {0};
     bool just_added_lift = false;
-    bool just_added_tilt = false;
     int64_t added_time_us = 0;
     bool updating_from_mqtt = false;
     bool skip_next_target_update = false;
@@ -423,7 +405,6 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
     if (entry != NULL) {
         strncpy(device_sn, entry->device_sn, sizeof(device_sn) - 1);
         just_added_lift = entry->just_added_lift;
-        just_added_tilt = entry->just_added_tilt;
         added_time_us = entry->added_time_us;
         updating_from_mqtt = entry->updating_from_mqtt;
         // P1-4: 带超时的 skip 检查——超过 500ms 视为过期，不跳过
@@ -435,6 +416,14 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
             }
             entry->skip_next_target_update = false;  // 读后立即清除
             entry->skip_target_update_time_us = 0;
+        }
+    } else {
+        // 主端点未找到，检查是否为模式选择端点
+        for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
+            if (s_device_table[i].in_use && s_device_table[i].mode_ep_id == endpoint_id) {
+                strncpy(device_sn, s_device_table[i].device_sn, sizeof(device_sn) - 1);
+                break;
+            }
         }
     }
     taskEXIT_CRITICAL(&s_device_table_lock);
@@ -506,73 +495,19 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
 
             push_matter_event(MATTER_EVENT_LIFT_CHANGED, endpoint_id, device_sn, lora_value);
         }
-        // Tilt 位置控制（内倒功能）
-        // 用户拖动 Tilt 滑块触发，发送 LoRa value=200 内倒命令
-        // 注意：Tilt 位置不代表实际内倒状态（LoRa 不上报内倒完成状态），
-        // 用户可重复拖动滑块触发内倒，位置值仅作为触发条件
-        else if (attribute_id == ATTR_TARGET_TILT_PERCENT_100THS) {
-            // 跳过内部更新（MQTT→Matter 方向，未来扩展用）
-            if (updating_from_mqtt) {
-                return ESP_OK;
-            }
+    }
 
-            // 跳过端点刚创建时 SDK 触发的首次 Tilt 属性变更
-            // per-feature 独立清除：此处仅清除 just_added_tilt，不影响 Lift 标志
-            // 避免 Lift 分支未触发时 Tilt 标志被错误清除，也避免 Lift 先清除后
-            // Tilt 首次变更不被跳过导致意外内倒
-            // P2-3 修复：增加超时机制（与 just_added_lift 对称）
-            // P-HomeKit4 修复：超时从 5000ms 缩短到 2000ms
-            if (just_added_tilt) {
-                int64_t added_elapsed_ms = (esp_timer_get_time() - added_time_us) / 1000;
-                // 无论是否超时都清除标志（读后即清除语义，防止标志残留）
-                taskENTER_CRITICAL(&s_device_table_lock);
-                bridged_device_entry_t *e = find_by_endpoint(endpoint_id);
-                if (e != NULL) e->just_added_tilt = false;
-                taskEXIT_CRITICAL(&s_device_table_lock);
-                // P-HomeKit4 修复：窗口从 5000ms 缩短到 2000ms（与 just_added_lift 对称）
-                if (added_elapsed_ms < 2000) {
-                    ESP_LOGI(TAG, "跳过端点初始化的 Tilt 属性变更: ep=%u", endpoint_id);
-                    return ESP_OK;
-                }
-                // 超时：SDK 未触发首次变更，视为用户真实控制命令，继续处理
-                ESP_LOGW(TAG, "just_added_tilt 超时，视为用户命令继续处理: ep=%u", endpoint_id);
-                // 不 return，继续走后面的控制逻辑
-            }
-
-            // val 类型校验：TargetPositionTiltPercent100ths 必须是 uint16/nullable uint16
-            if (val == NULL || (val->type != ESP_MATTER_VAL_TYPE_UINT16 &&
-                                val->type != ESP_MATTER_VAL_TYPE_NULLABLE_UINT16)) {
-                ESP_LOGW(TAG, "位置属性类型异常: ep=%u type=%d，跳过", endpoint_id, val ? val->type : -1);
-                return ESP_OK;
-            }
-
-            // P1-1 修复：nullable<uint16_t> null 值=0xFFFF，跳过无效值
-            if (val->val.u16 == 0xFFFF) {
-                ESP_LOGW(TAG, "Tilt 位置属性为 null，跳过: ep=%u", endpoint_id);
-                return ESP_OK;
-            }
-
-            uint16_t tilt_percent_100ths = val->val.u16;
-            ESP_LOGI(TAG, "Matter 内倒控制(Tilt): ep=%u sn=%s tilt=%u (raw=%u) → lora=200",
-                     endpoint_id, device_sn, tilt_percent_100ths / 100, tilt_percent_100ths);
-
-            // 发送内倒命令（LoRa value=200）
-            // MATTER_EVENT_TILT_TOGGLE 事件类型保持不变，协议桥接层按 value=200 处理
-            push_matter_event(MATTER_EVENT_TILT_TOGGLE, endpoint_id, device_sn, 200);
-
-            // P2-3 修复：同步 CurrentPositionTiltPercent100ths = Target，避免 App 滑块回弹
-            // LoRa 不上报内倒完成状态，这里让 Current=Target 保持 UI 一致
-            esp_err_t tilt_sync_err = attribute::update(endpoint_id, WindowCovering::Id,
-                              ATTR_CURRENT_TILT_PERCENT_100THS, val);
-            if (tilt_sync_err != ESP_OK) {
-                ESP_LOGW(TAG, "同步 CurrentTilt 失败: ep=%u err=%s", endpoint_id, esp_err_to_name(tilt_sync_err));
-            }
-
-            // P-HomeKit2 修复：重置 TargetPositionTiltPercent100ths 为 null，解决重复触发问题。
-            // 原实现在 PRE_UPDATE 回调中递归调用 attribute::update 更新同一属性，
-            // 但 null 值会被外层 set_val 覆盖为用户值，重置无效。
-            // 现移到 POST_UPDATE 回调中执行（见函数开头的 POST_UPDATE 处理），
-            // 外层 set_val 已完成，null 重置可以正确持久化。
+    // OnOff cluster - 跳过内倒自动重置触发的更新
+    if (cluster_id == OnOff::Id && attribute_id == ATTR_ON_OFF) {
+        bool skip = false;
+        taskENTER_CRITICAL(&s_device_table_lock);
+        bridged_device_entry_t *e = find_by_endpoint(endpoint_id);
+        if (e != NULL && e->updating_onoff_niedao) {
+            skip = true;
+        }
+        taskEXIT_CRITICAL(&s_device_table_lock);
+        if (skip) {
+            return ESP_OK;
         }
     }
 
@@ -655,10 +590,16 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
             for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
                 if (s_device_table[i].in_use) {
                     uint16_t ep = s_device_table[i].endpoint_id;
+                    uint16_t mode_ep = s_device_table[i].mode_ep_id;
                     taskEXIT_CRITICAL(&s_device_table_lock);
                     MatterReportingAttributeChangeCallback(
                         ep, BridgedDeviceBasicInformation::Id,
                         BridgedDeviceBasicInformation::Attributes::Reachable::Id);
+                    if (mode_ep != 0) {
+                        MatterReportingAttributeChangeCallback(
+                            mode_ep, BridgedDeviceBasicInformation::Id,
+                            BridgedDeviceBasicInformation::Attributes::Reachable::Id);
+                    }
                     taskENTER_CRITICAL(&s_device_table_lock);
                 }
             }
@@ -670,54 +611,6 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         break;
     }
 }
-
-// ==================== ModeSelect SupportedModesManager ====================
-// 为所有桥接端点提供两个模式：内开内倒(0) 和 平开(1)
-// HomeKit 在设备详情页渲染为模式选择器
-using ModeOptionStructType = chip::app::Clusters::ModeSelect::Structs::ModeOptionStruct::Type;
-using SemanticTagStructType = chip::app::Clusters::ModeSelect::Structs::SemanticTagStruct::Type;
-
-static const char s_mode_label_tilt_turn[] = "\xe5\x86\x85\xe5\xbc\x80\xe5\x86\x85\xe5\x80\x92"; // "内开内倒"
-static const char s_mode_label_casement[]  = "\xe5\xb9\xb3\xe5\xbc\x80";                           // "平开"
-
-static SemanticTagStructType s_mode_tags_tilt_turn[] = { { .value = 0 } };
-static SemanticTagStructType s_mode_tags_casement[]  = { { .value = 1 } };
-
-static ModeOptionStructType s_mode_options[] = {
-    { .label = chip::CharSpan(s_mode_label_tilt_turn, strlen(s_mode_label_tilt_turn)),
-      .mode  = 0,
-      .semanticTags = chip::app::DataModel::List<const SemanticTagStructType>(s_mode_tags_tilt_turn, 1) },
-    { .label = chip::CharSpan(s_mode_label_casement, strlen(s_mode_label_casement)),
-      .mode  = 1,
-      .semanticTags = chip::app::DataModel::List<const SemanticTagStructType>(s_mode_tags_casement, 1) },
-};
-
-/**
- * @brief SupportedModesManager 实现——为所有端点返回相同的两个模式
- */
-class BridgeSupportedModesManager : public chip::app::Clusters::ModeSelect::SupportedModesManager
-{
-public:
-    ModeOptionsProvider getModeOptionsProvider(chip::EndpointId endpointId) const override
-    {
-        return ModeOptionsProvider(s_mode_options, s_mode_options + 2);
-    }
-
-    chip::Protocols::InteractionModel::Status getModeOptionByMode(
-        chip::EndpointId endpointId, uint8_t mode,
-        const chip::app::Clusters::ModeSelect::Structs::ModeOptionStruct::Type **dataPtr) const override
-    {
-        for (uint8_t i = 0; i < 2; i++) {
-            if (s_mode_options[i].mode == mode) {
-                *dataPtr = &s_mode_options[i];
-                return chip::Protocols::InteractionModel::Status::Success;
-            }
-        }
-        return chip::Protocols::InteractionModel::Status::UnsupportedAttribute;
-    }
-};
-
-static BridgeSupportedModesManager s_supported_modes_manager;
 
 // ==================== 公共 API ====================
 
@@ -869,29 +762,15 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     }
 
     // 2. 添加 WindowCovering device type（cluster 0x0102）
-    //    feature_flags = Lift + PositionAwareLift + Tilt + PositionAwareTilt
+    //    feature_flags = Lift + PositionAwareLift（仅升降，无 Tilt）
     //    - Lift/PositionAwareLift: 升降位置控制（开窗器主功能）
-    //    - Tilt/PositionAwareTilt: 倾斜位置控制（内倒功能）
-    //    Tilt 滑块在 App 中显示为第二个滑块，用户拖动触发 LoRa value=200 内倒命令
-    //    注意：必须手动预设 WC_FEATURE_POSITION_AWARE_TILT 位。SDK 的
-    //    feature::position_aware_tilt::add() 内部依赖 feature_flags 已含此位
-    //    才会创建位置属性（target/current_position_tilt_percent_100ths），
-    //    若仅依赖 SDK 自动置位，配置结构体传入时位置属性不会被创建。
+    //    内倒功能通过 OnOff cluster 实现（独立开关按钮），不再使用 Tilt feature
     endpoint::window_covering::config_t wc_config(WC_END_PRODUCT_TYPE_WINDOW);
-    wc_config.window_covering.type = WC_TYPE_LIFT_AND_TILT;
-    // ConfigStatus = 0x19 (Operational + LiftPositionAware + TiltPositionAware)
-    // 显式设置 TiltPositionAware (bit4) 确保 HomeKit 渲染 Tilt 滑块。
-    // 虽然 SDK position_aware_tilt::add() 内部也会 OR 此位，但显式设置更可靠，
-    // 避免SDK版本差异或 set_val_internal(false) 未持久化的风险。
-    // 涂鸦兼容性：经实测涂鸦 App 支持 TiltPositionAware 位，不影响子设备显示。
+    wc_config.window_covering.type = WC_TYPE_LIFT;
+    // ConfigStatus = 0x09 (Operational + LiftPositionAware)
     wc_config.window_covering.config_status = WC_CONFIG_STATUS_OPERATIONAL |
-                                              WC_CONFIG_STATUS_LIFT_POSITION_AWARE |
-                                              WC_CONFIG_STATUS_TILT_POSITION_AWARE;
-    wc_config.window_covering.feature_flags = WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT |
-                                              WC_FEATURE_TILT | WC_FEATURE_POSITION_AWARE_TILT;
-    // 初始化 Tilt 位置属性（Matter 规范：0%=完全打开/无倾斜，100%=完全关闭/最大倾斜）
-    wc_config.window_covering.features.position_aware_tilt.target_position_tilt_percent_100ths = nullable<uint16_t>(0);
-    wc_config.window_covering.features.position_aware_tilt.current_position_tilt_percent_100ths = nullable<uint16_t>(0);
+                                              WC_CONFIG_STATUS_LIFT_POSITION_AWARE;
+    wc_config.window_covering.feature_flags = WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT;
     // 初始化 Lift 位置属性（0=完全打开升降，与 LoRa 0=关闭 反转后一致）
     wc_config.window_covering.features.position_aware_lift.target_position_lift_percent_100ths = nullable<uint16_t>(0);
     wc_config.window_covering.features.position_aware_lift.current_position_lift_percent_100ths = nullable<uint16_t>(0);
@@ -906,12 +785,10 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     }
 
     // 2.1 补全 WindowCovering 缺失的 Matter 规范强制属性
-    //     esp_matter SDK 的 feature::position_aware_lift/tilt::add() 仅创建了
-    //     TargetPosition*Percent100ths 和 CurrentPosition*Percent100ths，
-    //     漏掉了以下 10 个强制属性。HomeKit 读取这些属性时返回 UnsupportedAttribute，
-    //     导致双滑块不渲染且添加设备时卡在“桥接设备”步骤。
-    //     根因分析：esp_matter SDK 未按 Matter Application Cluster Spec 7.4 完整创建
-    //     PositionAwareLift/PATilt feature 的全部强制属性。
+    //     esp_matter SDK 的 feature::position_aware_lift::add() 仅创建了
+    //     TargetPositionLiftPercent100ths 和 CurrentPositionLiftPercent100ths，
+    //     漏掉了以下 5 个强制属性。HomeKit 读取这些属性时返回 UnsupportedAttribute，
+    //     导致滑块不渲染且添加设备时卡住。
     {
         cluster_t *wc_cluster = cluster::get(endpoint, WindowCovering::Id);
         if (wc_cluster == NULL) {
@@ -933,23 +810,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
             esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_CLOSED_LIMIT_LIFT,
                 ATTRIBUTE_FLAG_NONE, esp_matter_uint16(10000));
 
-            // --- PositionAwareTilt 缺失属性 ---
-            // NumberOfActuationsTilt (0x0006): uint16, NONVOLATILE
-            cluster::window_covering::attribute::create_number_of_actuations_tilt(wc_cluster, 0);
-            // CurrentPositionTiltPercentage (0x0009): nullable uint8, NONVOLATILE
-            cluster::window_covering::attribute::create_current_position_tilt_percentage(
-                wc_cluster, nullable<uint8_t>(0));
-            // CurrentPositionTilt (0x0004): nullable uint16
-            esp_matter::attribute::create(wc_cluster, ATTR_CURRENT_POSITION_TILT,
-                ATTRIBUTE_FLAG_NULLABLE, esp_matter_nullable_uint16(nullable<uint16_t>(0)));
-            // InstalledOpenLimitTilt (0x0012): uint16 (全开位置=0)
-            esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_OPEN_LIMIT_TILT,
-                ATTRIBUTE_FLAG_NONE, esp_matter_uint16(0));
-            // InstalledClosedLimitTilt (0x0013): uint16 (全关位置=10000)
-            esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_CLOSED_LIMIT_TILT,
-                ATTRIBUTE_FLAG_NONE, esp_matter_uint16(10000));
-
-            ESP_LOGI(TAG, "已补全 WindowCovering 强制属性 (10个): ep=%u", endpoint::get_id(endpoint));
+            ESP_LOGI(TAG, "已补全 WindowCovering 强制属性 (5个): ep=%u", endpoint::get_id(endpoint));
         }
     }
 
@@ -974,10 +835,30 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         ESP_LOGI(TAG, "已注册 StopMotion 命令回调: ep=%u", ep_id_for_cmd);
     }
 
-    // 4.5 内倒功能已通过 WindowCovering Tilt feature 实现（Tilt 滑块）
-    //     用户拖动 Tilt 滑块触发 TargetPositionTiltPercent100ths 属性变更
-    //     app_attribute_update_cb 中处理并发送 LoRa value=200 内倒命令
-    //     不再需要单独的 OnOff cluster 和 Toggle 命令回调
+    // 4.5 添加 OnOff cluster（内倒动作）——仅 SN 前缀为 5005 的设备支持内倒
+    //    5005 = 内开内倒窗，支持内倒动作（LoRa value=200）
+    //    5001/5002/5003 = 普通升降窗，不支持内倒
+    //    HomeKit 在设备详情页渲染为开关按钮，用户点击开关 → OnOff=true
+    //    → POST_UPDATE 中发送 LoRa value=200 内倒命令
+    //    → 自动重置为 false（开关表现为按钮：按一下触发内倒，然后自动弹回）
+    bool support_niedao = (strncmp(device_sn, "5005", 4) == 0);
+    if (support_niedao) {
+        cluster::on_off::config_t on_off_config{};
+        on_off_config.on_off = false;
+        cluster_t *on_off_cluster = cluster::on_off::create(endpoint, &on_off_config,
+                                                             CLUSTER_FLAG_SERVER);
+        if (on_off_cluster == NULL) {
+            ESP_LOGE(TAG, "创建 OnOff cluster 失败: ep=%u", ep_id_for_cmd);
+        } else {
+            // 注册 On/Off/Toggle 命令（SDK on_off::create() 仅创建 Off 命令）
+            cluster::on_off::command::create_on(on_off_cluster);
+            cluster::on_off::command::create_off(on_off_cluster);
+            cluster::on_off::command::create_toggle(on_off_cluster);
+            ESP_LOGI(TAG, "已添加 OnOff cluster (内倒): ep=%u sn=%s", ep_id_for_cmd, device_sn);
+        }
+    } else {
+        ESP_LOGI(TAG, "设备不支持内倒，跳过 OnOff cluster: sn=%s", device_sn);
+    }
 
     // 4.6 添加 PowerSource cluster（电池电压）
     //    cluster::power_source::create() 内部会根据 feature_flags 自动调用
@@ -1007,26 +888,9 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         ESP_LOGI(TAG, "已添加 PowerSource cluster (Battery): ep=%u", ep_id_for_cmd);
     }
 
-    // 4.65 添加 ModeSelect cluster（窗锁模式选择：内开内倒/平开）
-    //      HomeKit 在设备详情页渲染为模式选择器，用户切换时触发 MQTT 命令：
-    //      {"ctype":"004","data":{"sn":"...","attribute":"rwp_wind_lock_mode","value":"0或1"}}
-    //      value=0 → 内开内倒模式, value=1 → 平开模式
-    //      delegate 传入 SupportedModesManager，在 endpoint::enable() 时由
-    //      ModeSelectDelegateInitCB 设置为全局单例。
-    cluster::mode_select::config_t ms_config{};
-    ms_config.delegate = &s_supported_modes_manager;
-    ms_config.current_mode = 0;  // 默认内开内倒模式
-    strncpy(ms_config.description, "Window Lock Mode", sizeof(ms_config.description) - 1);
-    cluster_t *ms_cluster = cluster::mode_select::create(endpoint, &ms_config,
-                                                          CLUSTER_FLAG_SERVER);
-    if (ms_cluster == NULL) {
-        ESP_LOGE(TAG, "创建 ModeSelect cluster 失败: ep=%u", ep_id_for_cmd);
-    } else {
-        // 添加 ModeSelect device type (0x0027)，让 HomeKit 在设备详情页渲染模式选择器
-        endpoint::add_device_type(endpoint, ESP_MATTER_MODE_SELECT_DEVICE_TYPE_ID,
-                                   ESP_MATTER_MODE_SELECT_DEVICE_TYPE_VERSION);
-        ESP_LOGI(TAG, "已添加 ModeSelect cluster (窗锁模式): ep=%u", ep_id_for_cmd);
-    }
+    // 4.65 移除 ModeSelect cluster，改用独立 OnOff 端点实现模式选择
+    //     ModeSelect cluster 在 HomeKit 中不渲染模式选择器 UI
+    //     改用独立 bridged_node + OnOff 开关：ON=平开(1), OFF=内倒(0)
 
     // 4.7 添加 BridgedDeviceBasicInformation 属性
     // SDK 的 bridged_device_basic_information::create() 仅创建 Reachable 和 UniqueID(空)，
@@ -1092,19 +956,19 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         ESP_LOGW(TAG, "获取 BridgedDeviceBasicInformation cluster 失败，设备名将为默认值");
     }
 
-    // 5. 在启用端点前先记录到设备表（just_added_lift=tilt=true）
+    // 5. 在启用端点前先记录到设备表（just_added_lift=true）
     //    确保 SDK 在 endpoint::enable() 触发的首次 TargetPosition 变更时，
-    //    find_by_endpoint() 能找到 entry 并通过 just_added_lift/tilt 跳过，避免开窗器意外动作。
-    //    per-feature 独立：Lift 和 Tilt 各自首次变更独立跳过，互不干扰。
+    //    find_by_endpoint() 能找到 entry 并通过 just_added_lift 跳过，避免开窗器意外动作。
     uint16_t ep_id = endpoint::get_id(endpoint);
     taskENTER_CRITICAL(&s_device_table_lock);
     entry->endpoint_id = ep_id;
     strncpy(entry->device_sn, device_sn, sizeof(entry->device_sn) - 1);
     entry->device_sn[sizeof(entry->device_sn) - 1] = '\0';
-    // 标记刚创建，跳过 SDK 默认 delegate 的首次 TargetPosition/Tilt 变更
+    // 标记刚创建，跳过 SDK 默认 delegate 的首次 TargetPosition 变更
     entry->just_added_lift = true;
-    entry->just_added_tilt = true;
     // 显式重置所有运行时标志（防止 slot 复用时残留旧值）
+    entry->mode_ep_id = 0;
+    entry->updating_onoff_niedao = false;
     entry->updating_from_mqtt = false;
     entry->skip_next_target_update = false;
     entry->skip_target_update_time_us = 0;
@@ -1144,13 +1008,9 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     //    覆盖，但为保险起见统一在 enable() 后强制重设所有影响 HomeKit UI
     //    渲染的关键属性。
 
-    // 7a. 强制重设 FeatureMap（Lift+PALift+Tilt+PATilt = 0x17）
-    //     FeatureMap 是 ATTRIBUTE_FLAG_NONE（非 NONVOLATILE），理论上不会被覆盖。
-    //     但 HomeKit 通过 FeatureMap 判断是否支持 Tilt 能力，若 Tilt/PATilt 位
-    //     丢失则不渲染 Tilt 滑块，故强制重设作为保险。
+    // 7a. 强制重设 FeatureMap（Lift+PALift = 0x05）
     esp_matter_attr_val_t fm_val = esp_matter_bitmap32(
-        WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT |
-        WC_FEATURE_TILT | WC_FEATURE_POSITION_AWARE_TILT);
+        WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT);
     esp_err_t fm_err = attribute::update(ep_id, WindowCovering::Id,
                                           ATTR_FEATURE_MAP, &fm_val);
     if (fm_err != ESP_OK) {
@@ -1159,8 +1019,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
 
     // 7b. 强制重设 ConfigStatus（NONVOLATILE，会被 NVS 旧值覆盖）
     esp_matter_attr_val_t cs_val = esp_matter_bitmap8(
-        WC_CONFIG_STATUS_OPERATIONAL | WC_CONFIG_STATUS_LIFT_POSITION_AWARE |
-        WC_CONFIG_STATUS_TILT_POSITION_AWARE);
+        WC_CONFIG_STATUS_OPERATIONAL | WC_CONFIG_STATUS_LIFT_POSITION_AWARE);
     esp_err_t cs_err = attribute::update(ep_id, WindowCovering::Id,
                                           ATTR_CONFIG_STATUS, &cs_val);
     if (cs_err != ESP_OK) {
@@ -1168,7 +1027,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     }
 
     // 7c. 强制重设 Type（非 NONVOLATILE，但保险措施）
-    esp_matter_attr_val_t type_val = esp_matter_enum8(WC_TYPE_LIFT_AND_TILT);
+    esp_matter_attr_val_t type_val = esp_matter_enum8(WC_TYPE_LIFT);
     esp_err_t type_err = attribute::update(ep_id, WindowCovering::Id,
                                            ATTR_TYPE, &type_val);
     if (type_err != ESP_OK) {
@@ -1176,7 +1035,6 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     }
 
     // 7d. 强制重设 EndProductType（非 NONVOLATILE，但保险措施）
-    //     0x0A=InteriorBlind 同时支持 Lift+Tilt，HomeKit 渲染双滑块
     esp_matter_attr_val_t ept_val = esp_matter_enum8(WC_END_PRODUCT_TYPE_WINDOW);
     esp_err_t ept_err = attribute::update(ep_id, WindowCovering::Id,
                                           ATTR_END_PRODUCT_TYPE, &ept_val);
@@ -1184,16 +1042,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         ESP_LOGW(TAG, "更新 EndProductType 失败: ep=%u err=%s", ep_id, esp_err_to_name(ept_err));
     }
 
-    // 7e. 初始化 Tilt 位置 data version（NONVOLATILE，需重设）
-    esp_matter_attr_val_t tilt_val = esp_matter_nullable_uint16(nullable<uint16_t>(0));
-    esp_err_t tilt_err = attribute::update(ep_id, WindowCovering::Id,
-                                            ATTR_CURRENT_TILT_PERCENT_100THS, &tilt_val);
-    if (tilt_err != ESP_OK) {
-        ESP_LOGW(TAG, "初始化 Tilt data version 失败: ep=%u err=%s",
-                 ep_id, esp_err_to_name(tilt_err));
-    }
-
-    // 7f. 初始化 Lift 位置 data version（NONVOLATILE，需重设）
+    // 7e. 初始化 Lift 位置 data version（NONVOLATILE，需重设）
     esp_matter_attr_val_t lift_val = esp_matter_nullable_uint16(nullable<uint16_t>(0));
     esp_err_t lift_err = attribute::update(ep_id, WindowCovering::Id,
                                             ATTR_CURRENT_LIFT_PERCENT_100THS, &lift_val);
@@ -1202,48 +1051,118 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
                  ep_id, esp_err_to_name(lift_err));
     }
 
-    // 7g. 验证日志：读取所有关键属性的实际值，确认 HomeKit 会看到正确的双滑块配置
-    //     使用 attribute::get_val() 读取实际值（与控制器读取路径一致）
+    // 7f. 验证日志：读取所有关键属性的实际值
     {
         esp_matter_attr_val_t verify_val = esp_matter_invalid(NULL);
 
-        // FeatureMap（esp-matter 存储路径）
+        // FeatureMap
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_FEATURE_MAP, &verify_val) == ESP_OK) {
-            ESP_LOGI(TAG, "[验证] FeatureMap=0x%04lX (期望0x0017) ep=%u", verify_val.val.u32, ep_id);
+            ESP_LOGI(TAG, "[验证] FeatureMap=0x%04lX (期望0x0005) ep=%u", verify_val.val.u32, ep_id);
         } else {
             ESP_LOGE(TAG, "[验证] FeatureMap 读取失败！ep=%u", ep_id);
         }
         // ConfigStatus
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_CONFIG_STATUS, &verify_val) == ESP_OK) {
-            ESP_LOGI(TAG, "[验证] ConfigStatus=0x%02X (期望0x19) ep=%u", verify_val.val.u8, ep_id);
+            ESP_LOGI(TAG, "[验证] ConfigStatus=0x%02X (期望0x09) ep=%u", verify_val.val.u8, ep_id);
         }
         // Type
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_TYPE, &verify_val) == ESP_OK) {
-            ESP_LOGI(TAG, "[验证] Type=0x%02X (期望0x08) ep=%u", verify_val.val.u8, ep_id);
+            ESP_LOGI(TAG, "[验证] Type=0x%02X (期望0x00) ep=%u", verify_val.val.u8, ep_id);
         }
         // EndProductType
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_END_PRODUCT_TYPE, &verify_val) == ESP_OK) {
-            ESP_LOGI(TAG, "[验证] EndProductType=0x%02X (期望0x0A) ep=%u", verify_val.val.u8, ep_id);
+            ESP_LOGI(TAG, "[验证] EndProductType=0x%02X (期望0x00) ep=%u", verify_val.val.u8, ep_id);
         }
         // CurrentPositionLiftPercent100ths
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_CURRENT_LIFT_PERCENT_100THS, &verify_val) == ESP_OK) {
             ESP_LOGI(TAG, "[验证] CurrentLift%%=0x%04X ep=%u", verify_val.val.u16, ep_id);
         }
-        // CurrentPositionTiltPercent100ths
-        if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_CURRENT_TILT_PERCENT_100THS, &verify_val) == ESP_OK) {
-            ESP_LOGI(TAG, "[验证] CurrentTilt%%=0x%04X ep=%u", verify_val.val.u16, ep_id);
-        }
-        // TargetPositionTiltPercent100ths
-        if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_TARGET_TILT_PERCENT_100THS, &verify_val) == ESP_OK) {
-            ESP_LOGI(TAG, "[验证] TargetTilt%%=0x%04X ep=%u", verify_val.val.u16, ep_id);
-        }
-        ESP_LOGI(TAG, "[验证] ===== WindowCovering 双滑块属性验证完成 ep=%u =====", ep_id);
+        ESP_LOGI(TAG, "[验证] ===== WindowCovering 属性验证完成 ep=%u =====", ep_id);
     }
 
     // 8. 显式更新 Reachable=true
     app_matter_bridge_update_reachable(ep_id, true);
 
-    // 9. 延迟 PartsList 二次通知（核心修复）
+    // 9. 创建模式选择端点（独立 bridged_node + OnOff 开关）——仅 5005 设备
+    //    HomeKit 中显示为独立开关配件：ON=平开模式(1), OFF=内倒模式(0)
+    //    用户切换时触发 MQTT 命令：rwp_wind_lock_mode
+    //    仅 SN 前缀为 5005 的内开内倒窗需要模式选择
+    if (support_niedao) {
+        endpoint::bridged_node::config_t mode_bridged_config{};
+        endpoint_t *mode_endpoint = endpoint::bridged_node::create(s_node, &mode_bridged_config,
+                                                                     ENDPOINT_FLAG_DESTROYABLE | ENDPOINT_FLAG_BRIDGE,
+                                                                     NULL);
+        if (mode_endpoint == NULL) {
+            ESP_LOGE(TAG, "创建模式选择 bridged_node 端点失败: ep=%u", ep_id);
+        } else {
+            // 添加 OnOff Light device type (0x0100)，HomeKit 渲染为开关
+            endpoint::add_device_type(mode_endpoint, ESP_MATTER_ON_OFF_LIGHT_DEVICE_TYPE_ID,
+                                       ESP_MATTER_ON_OFF_LIGHT_DEVICE_TYPE_VERSION);
+
+            // 创建 OnOff cluster
+            cluster::on_off::config_t mode_on_off_config{};
+            mode_on_off_config.on_off = false;  // 默认内倒模式
+            cluster_t *mode_on_off_cluster = cluster::on_off::create(mode_endpoint, &mode_on_off_config,
+                                                                      CLUSTER_FLAG_SERVER);
+            if (mode_on_off_cluster != NULL) {
+                cluster::on_off::command::create_on(mode_on_off_cluster);
+                cluster::on_off::command::create_off(mode_on_off_cluster);
+                cluster::on_off::command::create_toggle(mode_on_off_cluster);
+            }
+
+            // 添加 BDI 属性（最小化）
+            cluster_t *mode_bdi = cluster::get(mode_endpoint, BridgedDeviceBasicInformation::Id);
+            if (mode_bdi != NULL) {
+                const char *mode_display_name = (device_name != NULL) ? device_name : device_sn;
+                char mode_name[32] = {0};
+                strncpy(mode_name, mode_display_name, sizeof(mode_name) - 1);
+                cluster::bridged_device_basic_information::attribute::create_product_name(
+                    mode_bdi, mode_name, strlen(mode_name));
+                char mode_serial[32] = {0};
+                strncpy(mode_serial, device_sn, sizeof(mode_serial) - 1);
+                cluster::bridged_device_basic_information::attribute::create_serial_number(
+                    mode_bdi, mode_serial, strlen(mode_serial));
+                // 认证属性
+                const char *vendor_str = "成都慧尖科技有限公司";
+                char vendor_name[32] = {0};
+                strncpy(vendor_name, vendor_str, sizeof(vendor_name) - 1);
+                cluster::bridged_device_basic_information::attribute::create_vendor_name(
+                    mode_bdi, vendor_name, strlen(vendor_name));
+                cluster::bridged_device_basic_information::attribute::create_vendor_id(
+                    mode_bdi, CONFIG_DEVICE_VENDOR_ID);
+                cluster::bridged_device_basic_information::attribute::create_product_id(
+                    mode_bdi, CONFIG_DEVICE_PRODUCT_ID);
+                cluster::bridged_device_basic_information::attribute::create_hardware_version(mode_bdi, 1);
+                cluster::bridged_device_basic_information::attribute::create_software_version(mode_bdi, 1);
+            }
+
+            // 设置父端点为 aggregator
+            esp_err_t mode_parent_err = endpoint::set_parent_endpoint(mode_endpoint, s_aggregator);
+            if (mode_parent_err != ESP_OK) {
+                ESP_LOGE(TAG, "设置模式端点父端点失败: %s", esp_err_to_name(mode_parent_err));
+            }
+
+            // 启用模式端点
+            esp_err_t mode_enable_err = endpoint::enable(mode_endpoint);
+            if (mode_enable_err != ESP_OK) {
+                ESP_LOGE(TAG, "启用模式端点失败: %s", esp_err_to_name(mode_enable_err));
+            } else {
+                uint16_t mode_ep_id = endpoint::get_id(mode_endpoint);
+                // 记录到设备表
+                taskENTER_CRITICAL(&s_device_table_lock);
+                entry->mode_ep_id = mode_ep_id;
+                taskEXIT_CRITICAL(&s_device_table_lock);
+                // 设置 Reachable=true
+                app_matter_bridge_update_reachable(mode_ep_id, true);
+                ESP_LOGI(TAG, "创建模式选择端点: mode_ep=%u sn=%s (平开/内倒开关)",
+                         mode_ep_id, device_sn);
+            }
+        }
+    } else {
+        ESP_LOGI(TAG, "设备不支持模式选择，跳过模式端点: sn=%s", device_sn);
+    }
+
+    // 10. 延迟 PartsList 二次通知（核心修复）
     //    问题：SDK 在 endpoint::enable() 中发送的 PartsList 变更通知，
     //    可能因控制器订阅重建而丢失。
     //
@@ -1285,8 +1204,9 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
 
 esp_err_t app_matter_bridge_remove_device(uint16_t endpoint_id)
 {
-    // 临界区内查找+复制快照，然后清除表项（per-feature 标志由 clear_device_entry 一并清除）
+    // 临界区内查找+复制快照，然后清除表项
     char device_sn[32] = {0};
+    uint16_t mode_ep_to_destroy = 0;
     taskENTER_CRITICAL(&s_device_table_lock);
     bridged_device_entry_t *entry = find_by_endpoint(endpoint_id);
     if (entry == NULL) {
@@ -1294,8 +1214,18 @@ esp_err_t app_matter_bridge_remove_device(uint16_t endpoint_id)
         return ESP_ERR_NOT_FOUND;
     }
     strncpy(device_sn, entry->device_sn, sizeof(device_sn) - 1);
+    mode_ep_to_destroy = entry->mode_ep_id;
     clear_device_entry(entry);
     taskEXIT_CRITICAL(&s_device_table_lock);
+
+    // 销毁模式选择端点（如果存在）
+    if (mode_ep_to_destroy != 0) {
+        endpoint_t *mode_ep = endpoint::get(s_node, mode_ep_to_destroy);
+        if (mode_ep) {
+            endpoint::disable(mode_ep);
+            endpoint::destroy(s_node, mode_ep);
+        }
+    }
 
     endpoint_t *endpoint = endpoint::get(s_node, endpoint_id);
     if (endpoint) {
@@ -1303,10 +1233,111 @@ esp_err_t app_matter_bridge_remove_device(uint16_t endpoint_id)
         endpoint::destroy(s_node, endpoint);
     }
 
-    ESP_LOGI(TAG, "移除桥接端点: ep=%u sn=%s", endpoint_id, device_sn);
+    ESP_LOGI(TAG, "移除桥接端点: ep=%u mode_ep=%u sn=%s", endpoint_id, mode_ep_to_destroy, device_sn);
     push_matter_event(MATTER_EVENT_DEVICE_REMOVED, endpoint_id, device_sn, 0);
 
     return ESP_OK;
+}
+
+int app_matter_bridge_remove_all_devices(void)
+{
+    if (s_node == NULL) {
+        ESP_LOGW(TAG, "remove_all: node 未初始化");
+        return 0;
+    }
+
+    // 收集所有需要移除的端点 ID（临界区外不能调用 Matter API，先收集再销毁）
+    // 最多收集 MAX_BRIDGED_DEVICES * 2 个端点（每个设备可能有主端点 + 模式端点）
+    uint16_t eps_to_remove[MAX_BRIDGED_DEVICES * 2];
+    int ep_count = 0;
+
+    // 1. 从 s_device_table 收集已知端点（含模式端点）
+    taskENTER_CRITICAL(&s_device_table_lock);
+    for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
+        if (s_device_table[i].in_use) {
+            eps_to_remove[ep_count++] = s_device_table[i].endpoint_id;
+            if (s_device_table[i].mode_ep_id != 0) {
+                eps_to_remove[ep_count++] = s_device_table[i].mode_ep_id;
+            }
+        }
+    }
+    taskEXIT_CRITICAL(&s_device_table_lock);
+
+    // 2. 从 Matter node 枚举所有端点，补充 s_device_table 中没有的
+    //    esp_matter 不持久化动态端点结构（仅持久化 min_unused_endpoint_id 和属性值），
+    //    重启后只有 root + aggregator，但 HomeKit 仍缓存旧端点。
+    //    枚举确保能找到当前内存中的所有端点。
+    {
+        chip::DeviceLayer::StackLock lock;
+        endpoint_t *ep = endpoint::get_first(s_node);
+        while (ep != NULL && ep_count < (int)(sizeof(eps_to_remove) / sizeof(eps_to_remove[0]))) {
+            uint16_t ep_id = endpoint::get_id(ep);
+            // 跳过 root endpoint (0) 和 aggregator endpoint
+            if (ep_id != 0 && ep_id != s_aggregator_endpoint_id) {
+                // 检查是否已在列表中
+                bool found = false;
+                for (int i = 0; i < ep_count; i++) {
+                    if (eps_to_remove[i] == ep_id) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    eps_to_remove[ep_count++] = ep_id;
+                }
+            }
+            ep = endpoint::get_next(ep);
+        }
+    }
+
+    ESP_LOGI(TAG, "remove_all: 发现 %d 个端点需要移除", ep_count);
+
+    // 3. 逐个禁用并销毁端点（需要 StackLock）
+    int removed = 0;
+    if (ep_count > 0) {
+        chip::DeviceLayer::StackLock lock;
+        for (int i = 0; i < ep_count; i++) {
+            endpoint_t *endpoint = endpoint::get(s_node, eps_to_remove[i]);
+            if (endpoint != NULL) {
+                // disable() 内部会调用 report_parts_list_change_internal() 通知控制器
+                endpoint::disable(endpoint);
+                endpoint::destroy(s_node, endpoint);
+                removed++;
+                ESP_LOGI(TAG, "remove_all: 已销毁端点 ep=%u", eps_to_remove[i]);
+            }
+        }
+    }
+
+    // 4. 清空整个 s_device_table（不需要 StackLock）
+    taskENTER_CRITICAL(&s_device_table_lock);
+    for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
+        if (s_device_table[i].in_use) {
+            ESP_LOGI(TAG, "remove_all: 清理设备表项 sn=%s", s_device_table[i].device_sn);
+            clear_device_entry(&s_device_table[i]);
+        }
+    }
+    taskEXIT_CRITICAL(&s_device_table_lock);
+
+    // 5. 关键：无论是否销毁了端点，都主动通知 PartsList 变更
+    //    场景：重启后 esp_matter 内存中没有桥接端点（动态端点不持久化），
+    //    但 HomeKit 仍缓存旧端点。如果不通知，HomeKit 需要等订阅超时后
+    //    自行清理（可能数分钟）。发送 PartsList 报告后，HomeKit 下次
+    //    订阅报告周期会立即收到最新 PartsList（不含旧端点），快速移除卡片。
+    {
+        chip::DeviceLayer::StackLock lock;
+        ESP_LOGI(TAG, "remove_all: 通知 PartsList 变更 (aggregator_ep=%u, root_ep=0)", s_aggregator_endpoint_id);
+        // 通知 aggregator 的 PartsList
+        if (s_aggregator_endpoint_id != 0) {
+            MatterReportingAttributeChangeCallback(
+                s_aggregator_endpoint_id, DESCRIPTOR_CLUSTER_ID, DESCRIPTOR_ATTR_PARTS_LIST);
+        }
+        // 通知 root endpoint 的 PartsList
+        MatterReportingAttributeChangeCallback(
+            0, DESCRIPTOR_CLUSTER_ID, DESCRIPTOR_ATTR_PARTS_LIST);
+    }
+
+    ESP_LOGI(TAG, "remove_all: 完成，共移除 %d 个端点，已通知 PartsList", removed);
+    return removed;
 }
 
 esp_err_t app_matter_bridge_update_position(uint16_t endpoint_id, uint8_t lora_position)
@@ -1508,20 +1539,33 @@ esp_err_t app_matter_bridge_update_reachable(uint16_t endpoint_id, bool online)
     // 确保 HomeKit 重连后能获取端点 Reachable 状态并读取端点属性。
 
     bool should_report = true;
+    bool is_mode_ep = false;
     taskENTER_CRITICAL(&s_device_table_lock);
     bridged_device_entry_t *entry = find_by_endpoint(endpoint_id);
+    if (entry == NULL) {
+        // 主端点未找到，检查是否为模式选择端点（mode_ep_id 字段）
+        for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
+            if (s_device_table[i].in_use && s_device_table[i].mode_ep_id == endpoint_id) {
+                entry = &s_device_table[i];
+                is_mode_ep = true;
+                break;
+            }
+        }
+    }
     if (entry == NULL) {
         // 端点不在设备表中（可能已被移除），不调用 Matter API 避免对不存在的端点操作
         taskEXIT_CRITICAL(&s_device_table_lock);
         ESP_LOGW(TAG, "update_reachable 找不到 entry: ep=%u（端点可能已被移除）", endpoint_id);
         return ESP_ERR_NOT_FOUND;
     }
-    if (entry->reachable_initialized && entry->last_reachable == online) {
-        // 值未变化，跳过更新和报告
+    if (!is_mode_ep && entry->reachable_initialized && entry->last_reachable == online) {
+        // 值未变化，跳过更新和报告（仅主端点去重，模式端点总是报告）
         should_report = false;
     }
-    entry->reachable_initialized = true;
-    entry->last_reachable = online;
+    if (!is_mode_ep) {
+        entry->reachable_initialized = true;
+        entry->last_reachable = online;
+    }
     taskEXIT_CRITICAL(&s_device_table_lock);
 
     if (!should_report) {
