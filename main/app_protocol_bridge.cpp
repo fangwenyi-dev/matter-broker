@@ -1043,6 +1043,7 @@ static void local_remove_device(const char *dev_sn)
     if (map_cleaned) {
         ESP_LOGI(TAG, "本地清理: 已清理设备映射 dev=%s", dev_sn);
     }
+}
 
 /**
  * @brief 检查设备是否仍在映射表中（用于兜底清理判断）
