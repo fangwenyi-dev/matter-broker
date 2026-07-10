@@ -32,6 +32,7 @@ typedef enum {
     MATTER_EVENT_DEVICE_REMOVED,     /**< 设备移除 */
     MATTER_EVENT_STOP_MOTION,        /**< WindowCovering 停止命令（value=101） */
     MATTER_EVENT_TILT_TOGGLE,        /**< 子设备内倒命令（value=200，Tilt 滑块触发） */
+    MATTER_EVENT_MODE_CHANGED,       /**< 窗锁模式变更（value=0=内倒, 1=平开） */
     MATTER_EVENT_COMMISSIONING_COMPLETE, /**< Matter 配网完成，请求协议桥接层主动向所有已注册网关请求设备列表 */
 } matter_event_type_t;
 

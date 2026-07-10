@@ -37,8 +37,9 @@
 #include <app/reporting/reporting.h>
 #include <lib/core/TLVReader.h>
 #include <platform/PlatformManager.h>
-#include <app-common/zap-generated/attributes/Accessors.h>
 #include <string.h>
+#include <app-common/zap-generated/cluster-objects.h>
+#include <app/clusters/mode-select-server/supported-modes-manager.h>
 
 // Descriptor cluster ID 和 PartsList attribute ID（Matter 规范）
 // 用于在 CASE Session 建立后通知控制器重新读取 PartsList，发现新端点
@@ -64,6 +65,26 @@ static const char *TAG = "app_matter_bridge";
 #define ATTR_TARGET_TILT_PERCENT_100THS    0x000C   // TargetPositionTiltPercent100ths (uint16, 0-10000)
 #define ATTR_CURRENT_TILT_PERCENT_100THS   0x000F   // CurrentPositionTiltPercent100ths (uint16, 0-10000)
 #define ATTR_FEATURE_MAP                   0xFFFD   // FeatureMap (bitmap32): global attribute
+
+// ========== 缺失的 WindowCovering 强制属性 ID ==========
+// esp_matter SDK 的 feature::position_aware_lift/tilt::add() 仅创建了
+// TargetPosition*Percent100ths 和 CurrentPosition*Percent100ths，
+// 漏掉了以下 Matter 规范强制属性。HomeKit 读取这些属性时返回
+// UnsupportedAttribute，导致滑块不渲染且添加设备时卡住。
+#define ATTR_CURRENT_POSITION_LIFT         0x0003   // CurrentPositionLift (nullable uint16)
+#define ATTR_CURRENT_POSITION_TILT         0x0004   // CurrentPositionTilt (nullable uint16)
+#define ATTR_NUM_ACTUATIONS_LIFT           0x0005   // NumberOfActuationsLift (uint16)
+#define ATTR_NUM_ACTUATIONS_TILT           0x0006   // NumberOfActuationsTilt (uint16)
+#define ATTR_CURRENT_LIFT_PERCENTAGE       0x0008   // CurrentPositionLiftPercentage (nullable uint8)
+#define ATTR_CURRENT_TILT_PERCENTAGE       0x0009   // CurrentPositionTiltPercentage (nullable uint8)
+#define ATTR_INSTALLED_OPEN_LIMIT_LIFT     0x0010   // InstalledOpenLimitLift (uint16)
+#define ATTR_INSTALLED_CLOSED_LIMIT_LIFT   0x0011   // InstalledClosedLimitLift (uint16)
+#define ATTR_INSTALLED_OPEN_LIMIT_TILT     0x0012   // InstalledOpenLimitTilt (uint16)
+#define ATTR_INSTALLED_CLOSED_LIMIT_TILT   0x0013   // InstalledClosedLimitTilt (uint16)
+
+// ModeSelect cluster（Matter 规范 cluster ID = 0x0050）
+#define MODE_SELECT_CLUSTER_ID            0x0050
+#define ATTR_MODE_SELECT_CURRENT_MODE     0x0001   // CurrentMode (uint8)
 
 // WindowCovering feature flags（参见 SDK Enums.h）
 // bit0=Lift, bit1=Tilt, bit2=PositionAwareLift, bit4=PositionAwareTilt
@@ -134,6 +155,11 @@ typedef struct {
     // 后续仅当 online != last_reachable 时才报告
     bool reachable_initialized;
     bool last_reachable;
+    // P-Opt2: 属性值缓存——网关每 2 秒上报 002，值未变化时跳过 Matter 属性写入
+    // 避免每 2 秒 5 次 attribute::update 调用 + 6 行日志刷屏
+    // sentinel -1 = 未初始化（首次更新强制通过）
+    int16_t last_lora_position;   // 上次写入的 LoRa 位置 (0-100, -1=未初始化)
+    int32_t last_voltage_mv;      // 上次写入的电池电压 (mV, -1=未初始化)
 } bridged_device_entry_t;
 
 static bridged_device_entry_t s_device_table[MAX_BRIDGED_DEVICES] = {0};
@@ -229,6 +255,8 @@ static void clear_device_entry(bridged_device_entry_t *entry)
     entry->added_time_us = 0;
     entry->reachable_initialized = false;
     entry->last_reachable = false;
+    entry->last_lora_position = -1;
+    entry->last_voltage_mv = -1;
 }
 
 static void push_matter_event(matter_event_type_t type, uint16_t endpoint_id,
@@ -352,6 +380,26 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type,
             bridged_device_entry_t *e_clear = find_by_endpoint(endpoint_id);
             if (e_clear != NULL) e_clear->updating_from_mqtt = false;
             taskEXIT_CRITICAL(&s_device_table_lock);
+        }
+        // ModeSelect CurrentMode 变更 → 发送窗锁模式控制命令
+        // SDK 的 ChangeToMode 命令处理函数验证模式后直接 Set(CurrentMode)，
+        // POST_UPDATE 在属性写入后触发，此处发送 MQTT 命令。
+        // val->val.u8: 0=内开内倒模式, 1=平开模式
+        if (cluster_id == MODE_SELECT_CLUSTER_ID &&
+            attribute_id == ATTR_MODE_SELECT_CURRENT_MODE) {
+            char mode_sn[32] = {0};
+            taskENTER_CRITICAL(&s_device_table_lock);
+            bridged_device_entry_t *e = find_by_endpoint(endpoint_id);
+            if (e != NULL) {
+                strncpy(mode_sn, e->device_sn, sizeof(mode_sn) - 1);
+            }
+            taskEXIT_CRITICAL(&s_device_table_lock);
+            if (mode_sn[0] != '\0' && val != NULL) {
+                uint8_t mode_value = val->val.u8;
+                ESP_LOGI(TAG, "Matter 窗锁模式变更: ep=%u sn=%s mode=%u (0=内倒,1=平开)",
+                         endpoint_id, mode_sn, mode_value);
+                push_matter_event(MATTER_EVENT_MODE_CHANGED, endpoint_id, mode_sn, mode_value);
+            }
         }
         return ESP_OK;
     }
@@ -566,20 +614,18 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         // 关键修复：端点在 CASE Session 建立之前创建时，endpoint::enable() 的
         // PartsList 通知因无活跃 session 而丢失。
         // 控制器首次建立 CASE Session 后不会主动重新读取，导致看不到动态创建的端点。
-        // 解决方案：CASE Session 建立后（已配网），通知 aggregator 的 PartsList
-        // 属性变更，触发控制器重新读取并发现新端点。
-        // Reachable 不再批量通知（P-Speed1）：HomeKit 初始读取 + 订阅初始报告已覆盖。
+        // CASE Session 建立后通知 PartsList + Reachable（触发控制器重新发现端点并读取属性）
         if (is_matter_commissioned()) {
             // P-HomeKit3 修复：CASE Session 去重，30 秒内不重复通知。
             // HomeKit 从后台恢复或网络抖动会频繁重建 CASE Session，每次都批量通知
             // 会产生流量尖峰，与 HomeKit 自身的属性读取竞争网络带宽，
             // 导致「正在更新」时间延长。30 秒窗口覆盖正常重连间隔。
             //
-            // 优化说明（P-Speed1）：移除了 CASE Session 中的批量 Reachable 通知。
-            // 原实现每次 CASE Session 都遍历所有端点强制报告 Reachable=true，
-            // 但这些属性会被标记为 dirty，加入初始订阅报告，增大报文大小。
-            // 实际上 HomeKit 打开时会主动读取所有属性（含 Reachable），
-            // 且订阅建立后的初始报告也包含所有已订阅属性，无需额外推送。
+            // P-Speed1 回退：恢复了 CASE Session 中的批量 Reachable 通知。
+            // 原优化移除此通知，假设 HomeKit 初始读取和订阅初始报告已覆盖 Reachable。
+            // 但实测发现：当 HomeKit 重连后订阅被拆除时，它无法获取端点 Reachable 状态，
+            // 导致不读取端点属性（WindowCovering 滑块 + PowerSource 电池均不显示）。
+            // 恢复 Reachable 通知后，HomeKit 能正确读取端点属性，滑块和电池恢复正常。
             // Fix-Bug5: s_last_session_notify_us 仅在 Matter 事件回调中访问（单线程），
             // 无需锁保护。原代码使用 s_device_table_lock 语义错误且增加不必要竞争。
             static int64_t s_last_session_notify_us = 0;
@@ -590,14 +636,33 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
                 ESP_LOGI(TAG, "CASE Session 建立（<30s 内重复，跳过通知）");
                 break;
             }
-            ESP_LOGI(TAG, "Matter CASE Session 建立，通知 PartsList");
+            ESP_LOGI(TAG, "Matter CASE Session 建立，通知 PartsList + Reachable");
 
             // 通知 aggregator 的 PartsList 变更（触发控制器重新发现端点）
-            // 仅通知 PartsList，不批量通知 Reachable（HomeKit 初始读取已覆盖）
             if (s_aggregator_endpoint_id != 0) {
                 MatterReportingAttributeChangeCallback(
                     s_aggregator_endpoint_id, DESCRIPTOR_CLUSTER_ID, DESCRIPTOR_ATTR_PARTS_LIST);
             }
+
+            // P-Speed1 回退：恢复 CASE Session 中的批量 Reachable 通知。
+            // 原优化移除此通知，但当 HomeKit 重连后订阅被拆除时，
+            // 它无法获取端点 Reachable 状态，导致不读取端点属性
+            // （WindowCovering 滑块 + PowerSource 电池均不显示）。
+            // Reachable 通知触发 HomeKit 重新读取端点属性，恢复滑块和电池显示。
+            // 报文大小风险：仅通知 Reachable 属性（bool=1字节），
+            // 比完整属性报告小得多，不会导致 ReportData 过大。
+            taskENTER_CRITICAL(&s_device_table_lock);
+            for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
+                if (s_device_table[i].in_use) {
+                    uint16_t ep = s_device_table[i].endpoint_id;
+                    taskEXIT_CRITICAL(&s_device_table_lock);
+                    MatterReportingAttributeChangeCallback(
+                        ep, BridgedDeviceBasicInformation::Id,
+                        BridgedDeviceBasicInformation::Attributes::Reachable::Id);
+                    taskENTER_CRITICAL(&s_device_table_lock);
+                }
+            }
+            taskEXIT_CRITICAL(&s_device_table_lock);
         }
         break;
     }
@@ -605,6 +670,54 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         break;
     }
 }
+
+// ==================== ModeSelect SupportedModesManager ====================
+// 为所有桥接端点提供两个模式：内开内倒(0) 和 平开(1)
+// HomeKit 在设备详情页渲染为模式选择器
+using ModeOptionStructType = chip::app::Clusters::ModeSelect::Structs::ModeOptionStruct::Type;
+using SemanticTagStructType = chip::app::Clusters::ModeSelect::Structs::SemanticTagStruct::Type;
+
+static const char s_mode_label_tilt_turn[] = "\xe5\x86\x85\xe5\xbc\x80\xe5\x86\x85\xe5\x80\x92"; // "内开内倒"
+static const char s_mode_label_casement[]  = "\xe5\xb9\xb3\xe5\xbc\x80";                           // "平开"
+
+static SemanticTagStructType s_mode_tags_tilt_turn[] = { { .value = 0 } };
+static SemanticTagStructType s_mode_tags_casement[]  = { { .value = 1 } };
+
+static ModeOptionStructType s_mode_options[] = {
+    { .label = chip::CharSpan(s_mode_label_tilt_turn, strlen(s_mode_label_tilt_turn)),
+      .mode  = 0,
+      .semanticTags = chip::app::DataModel::List<const SemanticTagStructType>(s_mode_tags_tilt_turn, 1) },
+    { .label = chip::CharSpan(s_mode_label_casement, strlen(s_mode_label_casement)),
+      .mode  = 1,
+      .semanticTags = chip::app::DataModel::List<const SemanticTagStructType>(s_mode_tags_casement, 1) },
+};
+
+/**
+ * @brief SupportedModesManager 实现——为所有端点返回相同的两个模式
+ */
+class BridgeSupportedModesManager : public chip::app::Clusters::ModeSelect::SupportedModesManager
+{
+public:
+    ModeOptionsProvider getModeOptionsProvider(chip::EndpointId endpointId) const override
+    {
+        return ModeOptionsProvider(s_mode_options, s_mode_options + 2);
+    }
+
+    chip::Protocols::InteractionModel::Status getModeOptionByMode(
+        chip::EndpointId endpointId, uint8_t mode,
+        const chip::app::Clusters::ModeSelect::Structs::ModeOptionStruct::Type **dataPtr) const override
+    {
+        for (uint8_t i = 0; i < 2; i++) {
+            if (s_mode_options[i].mode == mode) {
+                *dataPtr = &s_mode_options[i];
+                return chip::Protocols::InteractionModel::Status::Success;
+            }
+        }
+        return chip::Protocols::InteractionModel::Status::UnsupportedAttribute;
+    }
+};
+
+static BridgeSupportedModesManager s_supported_modes_manager;
 
 // ==================== 公共 API ====================
 
@@ -792,6 +905,54 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         return err;
     }
 
+    // 2.1 补全 WindowCovering 缺失的 Matter 规范强制属性
+    //     esp_matter SDK 的 feature::position_aware_lift/tilt::add() 仅创建了
+    //     TargetPosition*Percent100ths 和 CurrentPosition*Percent100ths，
+    //     漏掉了以下 10 个强制属性。HomeKit 读取这些属性时返回 UnsupportedAttribute，
+    //     导致双滑块不渲染且添加设备时卡在“桥接设备”步骤。
+    //     根因分析：esp_matter SDK 未按 Matter Application Cluster Spec 7.4 完整创建
+    //     PositionAwareLift/PATilt feature 的全部强制属性。
+    {
+        cluster_t *wc_cluster = cluster::get(endpoint, WindowCovering::Id);
+        if (wc_cluster == NULL) {
+            ESP_LOGE(TAG, "获取 WindowCovering cluster 失败，无法补全属性");
+        } else {
+            // --- PositionAwareLift 缺失属性 ---
+            // NumberOfActuationsLift (0x0005): uint16, NONVOLATILE
+            cluster::window_covering::attribute::create_number_of_actuations_lift(wc_cluster, 0);
+            // CurrentPositionLiftPercentage (0x0008): nullable uint8, NONVOLATILE
+            cluster::window_covering::attribute::create_current_position_lift_percentage(
+                wc_cluster, nullable<uint8_t>(0));
+            // CurrentPositionLift (0x0003): nullable uint16
+            esp_matter::attribute::create(wc_cluster, ATTR_CURRENT_POSITION_LIFT,
+                ATTRIBUTE_FLAG_NULLABLE, esp_matter_nullable_uint16(nullable<uint16_t>(0)));
+            // InstalledOpenLimitLift (0x0010): uint16 (全开位置=0)
+            esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_OPEN_LIMIT_LIFT,
+                ATTRIBUTE_FLAG_NONE, esp_matter_uint16(0));
+            // InstalledClosedLimitLift (0x0011): uint16 (全关位置=10000)
+            esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_CLOSED_LIMIT_LIFT,
+                ATTRIBUTE_FLAG_NONE, esp_matter_uint16(10000));
+
+            // --- PositionAwareTilt 缺失属性 ---
+            // NumberOfActuationsTilt (0x0006): uint16, NONVOLATILE
+            cluster::window_covering::attribute::create_number_of_actuations_tilt(wc_cluster, 0);
+            // CurrentPositionTiltPercentage (0x0009): nullable uint8, NONVOLATILE
+            cluster::window_covering::attribute::create_current_position_tilt_percentage(
+                wc_cluster, nullable<uint8_t>(0));
+            // CurrentPositionTilt (0x0004): nullable uint16
+            esp_matter::attribute::create(wc_cluster, ATTR_CURRENT_POSITION_TILT,
+                ATTRIBUTE_FLAG_NULLABLE, esp_matter_nullable_uint16(nullable<uint16_t>(0)));
+            // InstalledOpenLimitTilt (0x0012): uint16 (全开位置=0)
+            esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_OPEN_LIMIT_TILT,
+                ATTRIBUTE_FLAG_NONE, esp_matter_uint16(0));
+            // InstalledClosedLimitTilt (0x0013): uint16 (全关位置=10000)
+            esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_CLOSED_LIMIT_TILT,
+                ATTRIBUTE_FLAG_NONE, esp_matter_uint16(10000));
+
+            ESP_LOGI(TAG, "已补全 WindowCovering 强制属性 (10个): ep=%u", endpoint::get_id(endpoint));
+        }
+    }
+
     // 3. 设置父端点为 aggregator（关键！让 aggregator 的 parts_list 包含此端点）
     err = endpoint::set_parent_endpoint(endpoint, s_aggregator);
     if (err != ESP_OK) {
@@ -835,14 +996,36 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     if (ps_cluster == NULL) {
         ESP_LOGE(TAG, "创建 PowerSource cluster 失败: ep=%u", ep_id_for_cmd);
     } else {
-        // P-HomeKit5 修复：初始值用 null（nullable 默认构造）而非 0。
-        // nullable<uint32_t>(0) = 值 0（0mV），HomeKit 显示 "0V"；
-        // nullable<uint32_t>() = null，HomeKit 显示 "未知"，等待 LoRa 首次上报。
+        // P-HomeKit5 修复（已回退）：初始值用 0 而非 null。
+        // nullable<uint32_t>() = null，HomeKit 不创建 BatteryService，电池信息完全不显示。
+        // nullable<uint32_t>(0) = 值 0（0mV），HomeKit 创建 BatteryService 并显示 "0V"，
+        // LoRa 首次上报后立即更新为真实值。"0V" 闪烁是可接受的临时状态。
         cluster::power_source::attribute::create_bat_voltage(ps_cluster,
-            nullable<uint32_t>(), nullable<uint32_t>(0), nullable<uint32_t>(0xFFFF));
+            nullable<uint32_t>(0), nullable<uint32_t>(0), nullable<uint32_t>(0xFFFF));
         cluster::power_source::attribute::create_bat_percent_remaining(ps_cluster,
-            nullable<uint8_t>(), nullable<uint8_t>(0), nullable<uint8_t>(200));
+            nullable<uint8_t>(0), nullable<uint8_t>(0), nullable<uint8_t>(200));
         ESP_LOGI(TAG, "已添加 PowerSource cluster (Battery): ep=%u", ep_id_for_cmd);
+    }
+
+    // 4.65 添加 ModeSelect cluster（窗锁模式选择：内开内倒/平开）
+    //      HomeKit 在设备详情页渲染为模式选择器，用户切换时触发 MQTT 命令：
+    //      {"ctype":"004","data":{"sn":"...","attribute":"rwp_wind_lock_mode","value":"0或1"}}
+    //      value=0 → 内开内倒模式, value=1 → 平开模式
+    //      delegate 传入 SupportedModesManager，在 endpoint::enable() 时由
+    //      ModeSelectDelegateInitCB 设置为全局单例。
+    cluster::mode_select::config_t ms_config{};
+    ms_config.delegate = &s_supported_modes_manager;
+    ms_config.current_mode = 0;  // 默认内开内倒模式
+    strncpy(ms_config.description, "Window Lock Mode", sizeof(ms_config.description) - 1);
+    cluster_t *ms_cluster = cluster::mode_select::create(endpoint, &ms_config,
+                                                          CLUSTER_FLAG_SERVER);
+    if (ms_cluster == NULL) {
+        ESP_LOGE(TAG, "创建 ModeSelect cluster 失败: ep=%u", ep_id_for_cmd);
+    } else {
+        // 添加 ModeSelect device type (0x0027)，让 HomeKit 在设备详情页渲染模式选择器
+        endpoint::add_device_type(endpoint, ESP_MATTER_MODE_SELECT_DEVICE_TYPE_ID,
+                                   ESP_MATTER_MODE_SELECT_DEVICE_TYPE_VERSION);
+        ESP_LOGI(TAG, "已添加 ModeSelect cluster (窗锁模式): ep=%u", ep_id_for_cmd);
     }
 
     // 4.7 添加 BridgedDeviceBasicInformation 属性
@@ -927,6 +1110,8 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     entry->skip_target_update_time_us = 0;
     entry->reachable_initialized = false;
     entry->last_reachable = false;
+    entry->last_lora_position = -1;
+    entry->last_voltage_mv = -1;
     // P1-A 修复：added_time_us 必须在 endpoint::enable() 之前设置。
     // enable() 可能同步触发首次 PRE_UPDATE 回调，若此时 added_time_us=0，
     // 超时判断 (esp_timer_get_time() - 0) / 1000 必然 > 5000ms，会走超时路径
@@ -960,20 +1145,16 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     //    渲染的关键属性。
 
     // 7a. 强制重设 FeatureMap（Lift+PALift+Tilt+PATilt = 0x17）
-    //     关键修复：esp-matter 的 attribute::update() 只更新 esp-matter 存储，
-    //     不更新 connectedhomeip 的 ember RAM 存储。而 DataModelProvider::ReadAttribute
-    //     读取 FeatureMap 时从 ember RAM 存储读取（因为 WindowCoverAttrAccess::Read
-    //     不处理 FeatureMap，且 WindowCovering 没有 ServerClusterInterface 集成文件）。
-    //     结果：ember RAM 存储中的 FeatureMap 是 ZAP 默认值（0x0005=Lift+PALift），
-    //     缺少 Tilt(0x02) 和 PositionAwareTilt(0x10) 位，HomeKit 不渲染 Tilt 滑块。
-    //     修复：使用 connectedhomeip 的 Attributes::FeatureMap::Set() 直接写入 ember RAM 存储。
-    uint32_t desired_feature_map = WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT |
-                                   WC_FEATURE_TILT | WC_FEATURE_POSITION_AWARE_TILT;
-    auto fm_status = chip::app::Clusters::WindowCovering::Attributes::FeatureMap::Set(ep_id, desired_feature_map);
-    if (fm_status != chip::Protocols::InteractionModel::Status::Success) {
-        ESP_LOGW(TAG, "更新 FeatureMap(ember) 失败: ep=%u status=0x%02X", ep_id, (uint8_t)fm_status);
-    } else {
-        ESP_LOGI(TAG, "FeatureMap(ember) 已设置: ep=%u val=0x%04lX", ep_id, desired_feature_map);
+    //     FeatureMap 是 ATTRIBUTE_FLAG_NONE（非 NONVOLATILE），理论上不会被覆盖。
+    //     但 HomeKit 通过 FeatureMap 判断是否支持 Tilt 能力，若 Tilt/PATilt 位
+    //     丢失则不渲染 Tilt 滑块，故强制重设作为保险。
+    esp_matter_attr_val_t fm_val = esp_matter_bitmap32(
+        WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT |
+        WC_FEATURE_TILT | WC_FEATURE_POSITION_AWARE_TILT);
+    esp_err_t fm_err = attribute::update(ep_id, WindowCovering::Id,
+                                          ATTR_FEATURE_MAP, &fm_val);
+    if (fm_err != ESP_OK) {
+        ESP_LOGW(TAG, "更新 FeatureMap 失败: ep=%u err=%s", ep_id, esp_err_to_name(fm_err));
     }
 
     // 7b. 强制重设 ConfigStatus（NONVOLATILE，会被 NVS 旧值覆盖）
@@ -1026,9 +1207,11 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     {
         esp_matter_attr_val_t verify_val = esp_matter_invalid(NULL);
 
-        // FeatureMap
+        // FeatureMap（esp-matter 存储路径）
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_FEATURE_MAP, &verify_val) == ESP_OK) {
             ESP_LOGI(TAG, "[验证] FeatureMap=0x%04lX (期望0x0017) ep=%u", verify_val.val.u32, ep_id);
+        } else {
+            ESP_LOGE(TAG, "[验证] FeatureMap 读取失败！ep=%u", ep_id);
         }
         // ConfigStatus
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_CONFIG_STATUS, &verify_val) == ESP_OK) {
@@ -1134,6 +1317,18 @@ esp_err_t app_matter_bridge_update_position(uint16_t endpoint_id, uint8_t lora_p
         return ESP_ERR_INVALID_ARG;
     }
 
+    // P-Opt2: 值未变化跳过——网关每 2 秒上报 002，位置相同时跳过属性写入
+    taskENTER_CRITICAL(&s_device_table_lock);
+    bridged_device_entry_t *cache_entry = find_by_endpoint(endpoint_id);
+    if (cache_entry != NULL && cache_entry->last_lora_position == (int16_t)lora_position) {
+        taskEXIT_CRITICAL(&s_device_table_lock);
+        return ESP_OK;  // 值未变化，跳过
+    }
+    if (cache_entry != NULL) {
+        cache_entry->last_lora_position = (int16_t)lora_position;
+    }
+    taskEXIT_CRITICAL(&s_device_table_lock);
+
     // 反转：LoRa 位置 → Matter 百分比
     uint8_t matter_percent = lora_to_matter_percent(lora_position);
     uint16_t matter_percent_100ths = (uint16_t)matter_percent * 100;
@@ -1231,6 +1426,18 @@ esp_err_t app_matter_bridge_update_battery(uint16_t endpoint_id, uint16_t voltag
         }
     }
 
+    // P-Opt2: 值未变化跳过——电压和估算百分比均未变化时跳过属性写入
+    taskENTER_CRITICAL(&s_device_table_lock);
+    bridged_device_entry_t *cache_entry = find_by_endpoint(endpoint_id);
+    if (cache_entry != NULL && cache_entry->last_voltage_mv == (int32_t)voltage_mv) {
+        taskEXIT_CRITICAL(&s_device_table_lock);
+        return ESP_OK;  // 值未变化，跳过
+    }
+    if (cache_entry != NULL) {
+        cache_entry->last_voltage_mv = (int32_t)voltage_mv;
+    }
+    taskEXIT_CRITICAL(&s_device_table_lock);
+
     ESP_LOGI(TAG, "更新 Matter 电池: ep=%u voltage=%umV → percent=%u%%",
              endpoint_id, voltage_mv, bat_percent);
 
@@ -1297,8 +1504,8 @@ esp_err_t app_matter_bridge_update_reachable(uint16_t endpoint_id, bool online)
     // 优化后：在 entry 中记录 last_reachable，仅变化时报告。
     // 首次调用（reachable_initialized=false）强制报告以初始化 data version。
     //
-    // 注意：CASE Session 建立时不再批量通知 Reachable（P-Speed1 优化），
-    // HomeKit 初始属性读取和订阅初始报告已覆盖 Reachable 值。
+    // 注意：CASE Session 建立时会批量通知 Reachable（P-Speed1 回退），
+    // 确保 HomeKit 重连后能获取端点 Reachable 状态并读取端点属性。
 
     bool should_report = true;
     taskENTER_CRITICAL(&s_device_table_lock);

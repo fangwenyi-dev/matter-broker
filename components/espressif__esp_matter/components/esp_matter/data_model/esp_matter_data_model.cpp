@@ -925,6 +925,12 @@ esp_err_t get_val(uint16_t endpoint_id, uint32_t cluster_id, uint32_t attribute_
     VerifyOrReturnError(val_type != ESP_MATTER_VAL_TYPE_INVALID, ESP_ERR_INVALID_ARG);
     VerifyOrReturnError(val_type != ESP_MATTER_VAL_TYPE_ARRAY, ESP_ERR_NOT_SUPPORTED);
 
+    // [DIAG] 追踪 WindowCovering FeatureMap 的 get_val 路径
+    bool diag_wc_fm = (cluster_id == 0x0102 && attribute_id == 0xFFFD);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_GV", "get_val ENTER: ep=%u val_type=%d", endpoint_id, (int)val_type);
+    }
+
     chip::Platform::ScopedMemoryBuffer<uint8_t> scoped_buf;
     scoped_buf.Calloc(k_max_tlv_size_to_read_attribute_value);
     if (scoped_buf.IsNull()) {
@@ -956,10 +962,20 @@ esp_err_t get_val(uint16_t endpoint_id, uint32_t cluster_id, uint32_t attribute_
         return ESP_FAIL;
     }
 
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_GV", "get_val: TLV bytes written=%u TriedEncode=%d",
+                 (unsigned)writer.GetLengthWritten(), encoder.TriedEncode() ? 1 : 0);
+        ESP_LOG_BUFFER_HEX_LEVEL("DIAG_GV", scoped_buf.Get(), writer.GetLengthWritten(), ESP_LOG_INFO);
+    }
+
     ESP_LOG_BUFFER_HEX_LEVEL("TLV data", scoped_buf.Get(), writer.GetLengthWritten(), ESP_LOG_DEBUG);
 
     val->type = val_type;
-    return get_val_from_tlv_data(scoped_buf.Get(), writer.GetLengthWritten(), val);
+    esp_err_t decode_err = get_val_from_tlv_data(scoped_buf.Get(), writer.GetLengthWritten(), val);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_GV", "get_val: decode err=%d val.u32=0x%08lX", (int)decode_err, (unsigned long)val->val.u32);
+    }
+    return decode_err;
 }
 
 static esp_err_t get_path_from_attribute_handle(const _attribute_t *attribute, uint16_t &endpoint_id,

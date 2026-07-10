@@ -40,6 +40,7 @@ static const char *TAG = "protocol_bridge";
 #define TOPIC_GATEWAY_REQ_FMT       "gateway/%s/req"   // 下发命令主题（用 LoRa 网关 SN）
 #define TOPIC_GATEWAY_RSP           "gateway/rpt_rsp"   // 状态上报主题
 #define ATTRIBUTE_W_TRAVEL          "w_travel"
+#define ATTRIBUTE_WIND_LOCK_MODE    "rwp_wind_lock_mode"
 #define MAX_COMMAND_ID              999999
 #define MAX_GATEWAYS                10
 #define DEVICE_SN_PREFIX_GATEWAY    "1001"  // 网关设备 SN 前缀，需跳过
@@ -666,6 +667,35 @@ static void handle_matter_event(const matter_event_t *event)
         send_device_control(event->device_sn, gw_sn, value_str);
         break;
     }
+    case MATTER_EVENT_MODE_CHANGED: {
+        // 窗锁模式变更：event->value = 0(内开内倒) 或 1(平开)
+        // 发送 ctype=004, attribute=rwp_wind_lock_mode
+        if (event->value != 0 && event->value != 1) {
+            ESP_LOGW(TAG, "MODE_CHANGED value=%d 无效，丢弃: dev=%s",
+                     event->value, event->device_sn);
+            break;
+        }
+        char gw_sn[32];
+        if (!find_gateway_for_device(event->device_sn, gw_sn, sizeof(gw_sn))) {
+            ESP_LOGW(TAG, "未找到设备 %s 的网关，无法发送模式命令", event->device_sn);
+            return;
+        }
+        // 构造模式控制命令（attribute=rwp_wind_lock_mode）
+        cJSON *data = cJSON_CreateObject();
+        if (data == NULL) {
+            ESP_LOGE(TAG, "cJSON_CreateObject 失败 (MODE_CHANGED)");
+            break;
+        }
+        cJSON_AddStringToObject(data, "sn", event->device_sn);
+        cJSON_AddStringToObject(data, "attribute", ATTRIBUTE_WIND_LOCK_MODE);
+        char value_str[4];
+        snprintf(value_str, sizeof(value_str), "%d", (int)event->value);
+        cJSON_AddStringToObject(data, "value", value_str);
+        publish_sh_to_gateway(gw_sn, "004", data);
+        ESP_LOGI(TAG, "发送窗锁模式命令: gw=%s dev=%s mode=%s",
+                 gw_sn, event->device_sn, value_str);
+        break;
+    }
     case MATTER_EVENT_DEVICE_ADDED:
         ESP_LOGI(TAG, "Matter 设备已添加: ep=%u sn=%s", event->endpoint_id, event->device_sn);
         break;
@@ -786,9 +816,9 @@ static void handle_ctype_001(const char *gw_sn, cJSON *data, int msg_id)
 /**
  * @brief 处理 ctype=002 设备列表
  *
- * LoRa 网关回复 002（带 devices 数组）
- * 桥接器遍历设备列表，为每个新设备创建 Matter 端点
- * 然后回复 002(errcode=0)
+ * LoRa 网关主动发送 002（带 devices 数组）作为状态上报。
+ * 桥接器遍历设备列表，为每个新设备创建 Matter 端点，
+ * 为已有设备更新位置和电池属性，然后回复 002(errcode=0)。
  */
 static void handle_ctype_002(const char *gw_sn, cJSON *data, int msg_id)
 {
@@ -931,7 +961,7 @@ static void handle_ctype_002(const char *gw_sn, cJSON *data, int msg_id)
 
     ESP_LOGI(TAG, "设备列表处理完成: gw=%s 总计=%d 新增=%d", gw_sn, device_count, new_count);
 
-    // Phase 3: 回复 002(errcode=0) — MQTT 操作，无需 StackLock
+    // Phase 3: 回复 002(errcode=0) — 协议要求，网关需要确认
     cJSON *resp_data = cJSON_CreateObject();
     if (resp_data == NULL) {
         ESP_LOGE(TAG, "cJSON_CreateObject 失败 (002 resp_data)");
@@ -1101,29 +1131,21 @@ static void handle_ctype_003(const char *gw_sn, cJSON *data, int msg_id)
         }
         // StackLock 已释放，清理映射表不需要 Matter API
         // 清理设备→网关映射表条目，防止映射表空间泄漏
-        bool map_cleaned = false;
-        char cleaned_gw_sn[32] = {0};
         taskENTER_CRITICAL(&s_device_map_lock);
         for (int i = 0; i < MAX_DEVICE_ENTRIES; i++) {
             if (s_device_gateway_map[i].in_use &&
                 strcmp(s_device_gateway_map[i].device_sn, dev_sn) == 0) {
                 s_device_gateway_map[i].in_use = false;
                 s_device_gateway_map[i].device_sn[0] = '\0';
-                strncpy(cleaned_gw_sn, s_device_gateway_map[i].gateway_sn, sizeof(cleaned_gw_sn) - 1);
                 s_device_gateway_map[i].gateway_sn[0] = '\0';
                 s_device_gateway_map[i].voltage_mv = 0;
                 s_device_gateway_map[i].state = 0;
                 s_device_gateway_map[i].add_seq = 0;
-                map_cleaned = true;
+                ESP_LOGI(TAG, "已清理设备映射: dev=%s gw=%s", dev_sn, gw_sn);
                 break;
             }
         }
         taskEXIT_CRITICAL(&s_device_map_lock);
-        // P-Crash1 修复：ESP_LOGI 不能在 taskENTER_CRITICAL 临界区内调用！
-        // vprintf 需要获取 newlib 递归锁，临界区关闭调度器导致死锁 → abort()
-        if (map_cleaned) {
-            ESP_LOGI(TAG, "已清理设备映射: dev=%s gw=%s", dev_sn, cleaned_gw_sn[0] ? cleaned_gw_sn : gw_sn);
-        }
     } else {
         // 配对成功：添加 Matter 端点
         ESP_LOGI(TAG, "设备配对成功: gw=%s dev=%s", gw_sn, dev_sn);

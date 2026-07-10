@@ -316,25 +316,68 @@ CHIP_ERROR provider::Shutdown()
 
 ActionReturnStatus provider::ReadAttribute(const ReadAttributeRequest &request, AttributeValueEncoder &encoder)
 {
+    // [DIAG] 诊断日志：追踪 WindowCovering FeatureMap 读取路径
+    constexpr uint32_t kDiagClusterWC = 0x0102;
+    constexpr uint32_t kDiagAttrFeatureMap = 0xFFFD;
+    bool diag_wc_fm = (request.path.mClusterId == kDiagClusterWC &&
+                       request.path.mAttributeId == kDiagAttrFeatureMap);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute ENTER: ep=%u cl=0x%04lX attr=0x%04lX",
+                 request.path.mEndpointId, (unsigned long)request.path.mClusterId,
+                 (unsigned long)request.path.mAttributeId);
+    }
+
     if (auto *cluster = mRegistry.Get(request.path); cluster != nullptr) {
+        if (diag_wc_fm) {
+            ESP_LOGI("DIAG_RA", "ReadAttribute: mRegistry HIT (SCI) — returning via cluster->ReadAttribute");
+        }
         return cluster->ReadAttribute(request, encoder);
     }
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: mRegistry MISS (no SCI)");
+    }
+
     Status status = CheckDataModelPath(request.path);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: CheckDataModelPath status=%d", (int)status);
+    }
     VerifyOrReturnValue(status == Protocols::InteractionModel::Status::Success,
                         CHIP_ERROR_IM_GLOBAL_STATUS_VALUE(status));
     attribute_t *attribute =
         attribute::get(request.path.mEndpointId, request.path.mClusterId, request.path.mAttributeId);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: attribute::get %s", attribute ? "FOUND" : "NULL");
+    }
 
+    auto *aai = AttributeAccessInterfaceRegistry::Instance().Get(request.path.mEndpointId, request.path.mClusterId);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: AAI %s", aai ? "EXISTS" : "NULL");
+    }
     std::optional<CHIP_ERROR> aai_result = TryReadViaAccessInterface(
-        request.path,
-        AttributeAccessInterfaceRegistry::Instance().Get(request.path.mEndpointId, request.path.mClusterId), encoder);
+        request.path, aai, encoder);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: AAI result has_value=%d", aai_result.has_value() ? 1 : 0);
+        if (aai_result.has_value()) {
+            ESP_LOGI("DIAG_RA", "ReadAttribute: AAI returned error=0x%08x", (unsigned)*aai_result);
+        }
+    }
     VerifyOrReturnError(!aai_result.has_value(), *aai_result);
 
     esp_matter_attr_val_t val = esp_matter_invalid(nullptr);
-    VerifyOrReturnValue(attribute::get_val_internal(attribute, &val) == ESP_OK,
+    esp_err_t gi_err = attribute::get_val_internal(attribute, &val);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: get_val_internal err=%d val.u32=0x%08lX type=%d",
+                 (int)gi_err, (unsigned long)val.val.u32, (int)val.type);
+    }
+    VerifyOrReturnValue(gi_err == ESP_OK,
                         Protocols::InteractionModel::Status::Failure);
     attribute_data_encode_buffer data_buffer(val);
-    return encoder.Encode(data_buffer);
+    auto encode_result = encoder.Encode(data_buffer);
+    if (diag_wc_fm) {
+        ESP_LOGI("DIAG_RA", "ReadAttribute: encoder.Encode result=0x%08x TriedEncode=%d",
+                 (unsigned)encode_result, encoder.TriedEncode() ? 1 : 0);
+    }
+    return encode_result;
 }
 
 ActionReturnStatus provider::WriteAttribute(const WriteAttributeRequest &request, AttributeValueDecoder &decoder)

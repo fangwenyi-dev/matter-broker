@@ -29,6 +29,9 @@
 #include <lib/support/TypeTraits.h>
 #include <string.h>
 
+// [DIAG] 诊断日志需要
+#include "esp_log.h"
+
 #ifdef MATTER_DM_PLUGIN_SCENES_MANAGEMENT
 #include <app/clusters/scenes-server/scenes-server.h>
 #endif // MATTER_DM_PLUGIN_SCENES_MANAGEMENT
@@ -117,6 +120,11 @@ namespace WindowCovering {
 
 CHIP_ERROR WindowCoverAttrAccess::Read(const ConcreteReadAttributePath & aPath, AttributeValueEncoder & aEncoder)
 {
+    // [DIAG] 追踪 AAI 对 FeatureMap(0xFFFD) 的处理
+    if (aPath.mAttributeId == 0xFFFD) {
+        ESP_LOGI("DIAG_AAI", "WindowCoverAttrAccess::Read FeatureMap ep=%u — NOT handled, returning CHIP_NO_ERROR without encode",
+                 aPath.mEndpointId);
+    }
     switch (aPath.mAttributeId)
     {
     case Attributes::ClusterRevision::Id:
