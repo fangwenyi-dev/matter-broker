@@ -139,7 +139,8 @@ static int compute_display_priority(led_state_t *led, int color_index, int64_t n
     }
 
     // 颜色优先级：RED(3) > GREEN(2) > BLUE(1)
-    int color_pri = LED_COLOR_COUNT - color_index;
+    // LED_BLUE=0→1, LED_GREEN=1→2, LED_RED=2→3
+    int color_pri = color_index + 1;
 
     switch (led->mode) {
     case LED_MODE_OFF:

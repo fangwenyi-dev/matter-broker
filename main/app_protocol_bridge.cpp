@@ -320,9 +320,14 @@ static void register_gateway(const char *gw_sn)
             taskEXIT_CRITICAL(&s_device_map_lock);
 
             for (int k = 0; k < dev_count; k++) {
-                uint16_t ep_id;
-                if (app_matter_bridge_find_endpoint(dev_sns[k], &ep_id) == ESP_OK) {
+                uint16_t ep_id, mode_ep_id;
+                if (app_matter_bridge_find_endpoints(dev_sns[k], &ep_id, &mode_ep_id) == ESP_OK) {
                     app_matter_bridge_update_reachable(ep_id, true);
+                    // Bug 修复：同时更新模式端点 Reachable，否则 5005 设备的模式开关
+                    // 在网关离线恢复后仍显示离线
+                    if (mode_ep_id != 0) {
+                        app_matter_bridge_update_reachable(mode_ep_id, true);
+                    }
                 }
             }
         }
@@ -1017,6 +1022,9 @@ static void local_remove_device(const char *dev_sn)
     // StackLock 已释放
 
     // 2. 清理设备→网关映射表
+    // 注意：ESP_LOG 不能在 taskENTER_CRITICAL 临界区内调用，
+    // newlib 的 log lock 在临界区内获取会触发 lock_acquire_generic 的 abort() 检测。
+    bool map_cleaned = false;
     taskENTER_CRITICAL(&s_device_map_lock);
     for (int i = 0; i < MAX_DEVICE_ENTRIES; i++) {
         if (s_device_gateway_map[i].in_use &&
@@ -1027,12 +1035,14 @@ static void local_remove_device(const char *dev_sn)
             s_device_gateway_map[i].voltage_mv = 0;
             s_device_gateway_map[i].state = 0;
             s_device_gateway_map[i].add_seq = 0;
-            ESP_LOGI(TAG, "本地清理: 已清理设备映射 dev=%s", dev_sn);
+            map_cleaned = true;
             break;
         }
     }
     taskEXIT_CRITICAL(&s_device_map_lock);
-}
+    if (map_cleaned) {
+        ESP_LOGI(TAG, "本地清理: 已清理设备映射 dev=%s", dev_sn);
+    }
 
 /**
  * @brief 检查设备是否仍在映射表中（用于兜底清理判断）
@@ -1134,6 +1144,9 @@ static void handle_ctype_003(const char *gw_sn, cJSON *data, int msg_id)
         }
         // StackLock 已释放，清理映射表不需要 Matter API
         // 清理设备→网关映射表条目，防止映射表空间泄漏
+        // 注意：ESP_LOG 不能在 taskENTER_CRITICAL 临界区内调用，
+        // newlib 的 log lock 在临界区内获取会触发 lock_acquire_generic 的 abort() 检测。
+        bool map_cleaned = false;
         taskENTER_CRITICAL(&s_device_map_lock);
         for (int i = 0; i < MAX_DEVICE_ENTRIES; i++) {
             if (s_device_gateway_map[i].in_use &&
@@ -1144,11 +1157,14 @@ static void handle_ctype_003(const char *gw_sn, cJSON *data, int msg_id)
                 s_device_gateway_map[i].voltage_mv = 0;
                 s_device_gateway_map[i].state = 0;
                 s_device_gateway_map[i].add_seq = 0;
-                ESP_LOGI(TAG, "已清理设备映射: dev=%s gw=%s", dev_sn, gw_sn);
+                map_cleaned = true;
                 break;
             }
         }
         taskEXIT_CRITICAL(&s_device_map_lock);
+        if (map_cleaned) {
+            ESP_LOGI(TAG, "已清理设备映射: dev=%s gw=%s", dev_sn, gw_sn);
+        }
     } else {
         // 配对成功：添加 Matter 端点
         ESP_LOGI(TAG, "设备配对成功: gw=%s dev=%s", gw_sn, dev_sn);
@@ -1803,13 +1819,17 @@ void app_protocol_bridge_check_gateway_offline(void)
         }
         taskEXIT_CRITICAL(&s_device_map_lock);
 
-        // 2. StackLock 外：收集子设备端点 ID（find_endpoint 内部用设备表锁，不与 StackLock 冲突）
-        uint16_t dev_ep_ids[MAX_DEVICE_ENTRIES];
+        // 2. StackLock 外：收集子设备端点 ID（find_endpoints 内部用设备表锁，不与 StackLock 冲突）
+        // Bug 修复：同时收集主端点和模式端点 ID，网关离线时两者都需标记为不可达
+        uint16_t dev_ep_ids[MAX_DEVICE_ENTRIES * 2];
         int dev_ep_count = 0;
         for (int k = 0; k < dev_count; k++) {
-            uint16_t ep_id;
-            if (app_matter_bridge_find_endpoint(dev_sns[k], &ep_id) == ESP_OK) {
+            uint16_t ep_id, mode_ep_id;
+            if (app_matter_bridge_find_endpoints(dev_sns[k], &ep_id, &mode_ep_id) == ESP_OK) {
                 dev_ep_ids[dev_ep_count++] = ep_id;
+                if (mode_ep_id != 0) {
+                    dev_ep_ids[dev_ep_count++] = mode_ep_id;
+                }
             }
         }
 

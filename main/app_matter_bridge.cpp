@@ -116,6 +116,13 @@ static uint16_t s_aggregator_endpoint_id = 0;
 static volatile bool s_commissioning_complete = false;
 static portMUX_TYPE s_commissioning_lock = portMUX_INITIALIZER_UNLOCKED;
 
+// CASE Session 通知去重时间戳（文件作用域，配网完成时重置为 0）
+// 原为 kSecureSessionEstablished 内 static 局部变量，配网完成时无法重置。
+// Bug：PASE 配网会话触发 kSecureSessionEstablished 设置时间戳，配网完成后
+// HomeKit CASE Session 再次触发时在 30s 窗口内被跳过，导致 PartsList 通知
+// 不发送，HomeKit 发现不了桥接端点，卡在添加界面。
+static int64_t s_last_session_notify_us = 0;
+
 // 设备 SN ↔ 端点 ID 映射表
 #define MAX_BRIDGED_DEVICES CONFIG_MAX_BRIDGED_DEVICES
 typedef struct {
@@ -532,6 +539,14 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         s_commissioning_complete = true;
         taskEXIT_CRITICAL(&s_commissioning_lock);
         ESP_LOGI(TAG, "Matter 配网完成，已启用端点创建");
+
+        // Bug 修复：重置 CASE Session 去重时间戳。
+        // PASE 配网会话触发 kSecureSessionEstablished 时设置了 s_last_session_notify_us，
+        // 配网完成后 HomeKit 建立 CASE Session 时若在 30s 窗口内，PartsList 通知会被跳过，
+        // 导致 HomeKit 发现不了桥接端点，卡在添加界面。
+        // 重置为 0 确保下一次 kSecureSessionEstablished 必定触发通知。
+        s_last_session_notify_us = 0;
+
         // P-HomeKit6 修复：配网完成后主动请求设备列表，加速端点创建。
         // 首次配网时 LoRa 网关可能在配网前就上报了 002，但当时未配网无法创建端点。
         // 推送 COMMISSIONING_COMPLETE 事件，协议桥接层收到后向所有已注册网关发送 002。
@@ -556,14 +571,10 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
             // 会产生流量尖峰，与 HomeKit 自身的属性读取竞争网络带宽，
             // 导致「正在更新」时间延长。30 秒窗口覆盖正常重连间隔。
             //
-            // P-Speed1 回退：恢复了 CASE Session 中的批量 Reachable 通知。
-            // 原优化移除此通知，假设 HomeKit 初始读取和订阅初始报告已覆盖 Reachable。
-            // 但实测发现：当 HomeKit 重连后订阅被拆除时，它无法获取端点 Reachable 状态，
-            // 导致不读取端点属性（WindowCovering 滑块 + PowerSource 电池均不显示）。
-            // 恢复 Reachable 通知后，HomeKit 能正确读取端点属性，滑块和电池恢复正常。
-            // Fix-Bug5: s_last_session_notify_us 仅在 Matter 事件回调中访问（单线程），
-            // 无需锁保护。原代码使用 s_device_table_lock 语义错误且增加不必要竞争。
-            static int64_t s_last_session_notify_us = 0;
+            // Bug 修复：s_last_session_notify_us 在 kCommissioningComplete 中被重置为 0，
+            // 确保配网完成后 HomeKit 的首次 CASE Session 必定触发 PartsList 通知。
+            // 原代码使用 static 局部变量，配网完成时无法重置，导致 PASE → CASE
+            // 在 30s 内被去重跳过，HomeKit 卡在添加界面。
             int64_t now_us = esp_timer_get_time();
             int64_t last = s_last_session_notify_us;
             s_last_session_notify_us = now_us;
@@ -1004,20 +1015,24 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     //    原因：NONVOLATILE 属性（ConfigStatus、Mode、CurrentPosition*）在
     //    attribute::create() 时会从 NVS 加载旧值。当端点 ID 被复用（先解绑再配对）
     //    时，NVS 中残留的旧值会覆盖 config 中的新值。
-    //    虽然非 NONVOLATILE 属性（Type、EndProductType、FeatureMap）不会被 NVS
-    //    覆盖，但为保险起见统一在 enable() 后强制重设所有影响 HomeKit UI
-    //    渲染的关键属性。
+    //    SDK 的 MatterWindowCoveringPluginServerInitCallback 也会将 ConfigStatus
+    //    重置为 0x00（覆盖 config 中的 0x09），必须重新设置。
+    //
+    //    优化：非 NONVOLATILE 属性（Type、EndProductType、FeatureMap）不会被 NVS
+    //    覆盖，且 SDK init callback 不会修改它们。enable() 后直接读取验证即可，
+    //    无需强制 update。这样可以减少不必要的 attribute::update() 调用，
+    //    减少 ReportData 报文大小（每次 update 都会标记属性为 dirty），
+    //    避免 ReportData 超过 1000 字节导致 HomeKit 订阅被拆除。
 
-    // 7a. 强制重设 FeatureMap（Lift+PALift = 0x05）
-    esp_matter_attr_val_t fm_val = esp_matter_bitmap32(
-        WC_FEATURE_LIFT | WC_FEATURE_POSITION_AWARE_LIFT);
-    esp_err_t fm_err = attribute::update(ep_id, WindowCovering::Id,
-                                          ATTR_FEATURE_MAP, &fm_val);
-    if (fm_err != ESP_OK) {
-        ESP_LOGW(TAG, "更新 FeatureMap 失败: ep=%u err=%s", ep_id, esp_err_to_name(fm_err));
-    }
+    // 7a. 验证 FeatureMap（非 NONVOLATILE，不应被覆盖）
+    //     SDK 在 cluster create 时已用 config->feature_flags 初始化，
+    //     enable() 后 SDK init callback 不会修改它。
+    //     注意：attribute::update() 在 enable() 后会返回 ESP_ERR_INVALID_ARG，
+    //     因为 SDK init callback 改变了属性的内部类型表示。
+    //     但值本身是正确的（cluster create 时设置），无需 update。
+    //     此处仅读取验证，不调用 update。
 
-    // 7b. 强制重设 ConfigStatus（NONVOLATILE，会被 NVS 旧值覆盖）
+    // 7b. 强制重设 ConfigStatus（NONVOLATILE + SDK init callback 会重置为 0x00）
     esp_matter_attr_val_t cs_val = esp_matter_bitmap8(
         WC_CONFIG_STATUS_OPERATIONAL | WC_CONFIG_STATUS_LIFT_POSITION_AWARE);
     esp_err_t cs_err = attribute::update(ep_id, WindowCovering::Id,
@@ -1026,23 +1041,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         ESP_LOGW(TAG, "更新 ConfigStatus 失败: ep=%u err=%s", ep_id, esp_err_to_name(cs_err));
     }
 
-    // 7c. 强制重设 Type（非 NONVOLATILE，但保险措施）
-    esp_matter_attr_val_t type_val = esp_matter_enum8(WC_TYPE_LIFT);
-    esp_err_t type_err = attribute::update(ep_id, WindowCovering::Id,
-                                           ATTR_TYPE, &type_val);
-    if (type_err != ESP_OK) {
-        ESP_LOGW(TAG, "更新 Type 失败: ep=%u err=%s", ep_id, esp_err_to_name(type_err));
-    }
-
-    // 7d. 强制重设 EndProductType（非 NONVOLATILE，但保险措施）
-    esp_matter_attr_val_t ept_val = esp_matter_enum8(WC_END_PRODUCT_TYPE_WINDOW);
-    esp_err_t ept_err = attribute::update(ep_id, WindowCovering::Id,
-                                          ATTR_END_PRODUCT_TYPE, &ept_val);
-    if (ept_err != ESP_OK) {
-        ESP_LOGW(TAG, "更新 EndProductType 失败: ep=%u err=%s", ep_id, esp_err_to_name(ept_err));
-    }
-
-    // 7e. 初始化 Lift 位置 data version（NONVOLATILE，需重设）
+    // 7c. 初始化 Lift 位置 data version（NONVOLATILE，可能被 NVS 旧值覆盖）
     esp_matter_attr_val_t lift_val = esp_matter_nullable_uint16(nullable<uint16_t>(0));
     esp_err_t lift_err = attribute::update(ep_id, WindowCovering::Id,
                                             ATTR_CURRENT_LIFT_PERCENT_100THS, &lift_val);
@@ -1051,11 +1050,22 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
                  ep_id, esp_err_to_name(lift_err));
     }
 
+    // 7d. 初始化 CurrentPositionLiftPercentage（NONVOLATILE，手动创建的属性）
+    //     此属性是 Matter 规范的可选属性，HomeKit 部分版本会读取它渲染滑块位置。
+    //     不初始化会导致 data version 未建立，HomeKit 读取时报错。
+    esp_matter_attr_val_t lift_pct_val = esp_matter_nullable_uint8(nullable<uint8_t>(0));
+    esp_err_t lift_pct_err = attribute::update(ep_id, WindowCovering::Id,
+                                                ATTR_CURRENT_LIFT_PERCENTAGE, &lift_pct_val);
+    if (lift_pct_err != ESP_OK) {
+        ESP_LOGW(TAG, "初始化 CurrentPositionLiftPercentage 失败: ep=%u err=%s",
+                 ep_id, esp_err_to_name(lift_pct_err));
+    }
+
     // 7f. 验证日志：读取所有关键属性的实际值
     {
         esp_matter_attr_val_t verify_val = esp_matter_invalid(NULL);
 
-        // FeatureMap
+        // FeatureMap（仅读取验证，不调用 update）
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_FEATURE_MAP, &verify_val) == ESP_OK) {
             ESP_LOGI(TAG, "[验证] FeatureMap=0x%04lX (期望0x0005) ep=%u", verify_val.val.u32, ep_id);
         } else {
@@ -1065,11 +1075,11 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_CONFIG_STATUS, &verify_val) == ESP_OK) {
             ESP_LOGI(TAG, "[验证] ConfigStatus=0x%02X (期望0x09) ep=%u", verify_val.val.u8, ep_id);
         }
-        // Type
+        // Type（仅读取验证）
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_TYPE, &verify_val) == ESP_OK) {
             ESP_LOGI(TAG, "[验证] Type=0x%02X (期望0x00) ep=%u", verify_val.val.u8, ep_id);
         }
-        // EndProductType
+        // EndProductType（仅读取验证）
         if (attribute::get_val(ep_id, WindowCovering::Id, ATTR_END_PRODUCT_TYPE, &verify_val) == ESP_OK) {
             ESP_LOGI(TAG, "[验证] EndProductType=0x%02X (期望0x00) ep=%u", verify_val.val.u8, ep_id);
         }
@@ -1219,17 +1229,18 @@ esp_err_t app_matter_bridge_remove_device(uint16_t endpoint_id)
     taskEXIT_CRITICAL(&s_device_table_lock);
 
     // 销毁模式选择端点（如果存在）
+    // 注意：endpoint::destroy() 内部已调用 disable()，无需显式调用 disable()。
+    // 重复调用 disable() 会触发两次 MatterReportingAttributeChangeCallback(PartsList)，
+    // 增加不必要的报告开销，并可能延迟 HomeKit 端设备删除。
     if (mode_ep_to_destroy != 0) {
         endpoint_t *mode_ep = endpoint::get(s_node, mode_ep_to_destroy);
         if (mode_ep) {
-            endpoint::disable(mode_ep);
             endpoint::destroy(s_node, mode_ep);
         }
     }
 
     endpoint_t *endpoint = endpoint::get(s_node, endpoint_id);
     if (endpoint) {
-        endpoint::disable(endpoint);
         endpoint::destroy(s_node, endpoint);
     }
 
@@ -1299,8 +1310,7 @@ int app_matter_bridge_remove_all_devices(void)
         for (int i = 0; i < ep_count; i++) {
             endpoint_t *endpoint = endpoint::get(s_node, eps_to_remove[i]);
             if (endpoint != NULL) {
-                // disable() 内部会调用 report_parts_list_change_internal() 通知控制器
-                endpoint::disable(endpoint);
+                // destroy() 内部已调用 disable()，无需显式调用
                 endpoint::destroy(s_node, endpoint);
                 removed++;
                 ESP_LOGI(TAG, "remove_all: 已销毁端点 ep=%u", eps_to_remove[i]);
@@ -1403,6 +1413,19 @@ esp_err_t app_matter_bridge_update_position(uint16_t endpoint_id, uint8_t lora_p
         ESP_LOGW(TAG, "更新当前位置失败: %s", esp_err_to_name(current_err));
     }
 
+    // 3. 更新 CurrentPositionLiftPercentage (0x0008)
+    //    HomeKit 部分版本使用此属性（而非 Percent100ths）渲染滑块位置。
+    //    不更新会导致滑块位置与实际位置不一致。
+    //    类型：nullable uint8，范围 0-100（注意：不是 0-10000）
+    esp_matter_attr_val_t pct_val = esp_matter_nullable_uint8(nullable<uint8_t>(matter_percent));
+    esp_err_t pct_err = attribute::update(endpoint_id,
+                                           WindowCovering::Id,
+                                           ATTR_CURRENT_LIFT_PERCENTAGE,
+                                           &pct_val);
+    if (pct_err != ESP_OK) {
+        ESP_LOGW(TAG, "更新 CurrentPositionLiftPercentage 失败: %s", esp_err_to_name(pct_err));
+    }
+
     // OperationalStatus (0x000A) 是 Matter 规范中的只读属性，由 SDK 内部管理。
     // SDK 在收到 GoToLiftPercentage 命令时会自动设置 OperationalStatus 为运动中，
     // 运动完成后自动恢复为静止。应用层不应直接写入此属性。
@@ -1489,8 +1512,7 @@ esp_err_t app_matter_bridge_update_battery(uint16_t endpoint_id, uint16_t voltag
     esp_err_t pct_err = attribute::update(endpoint_id, PowerSource::Id,
                              ATTR_BAT_PERCENT_REMAINING, &pct_val);
     if (pct_err != ESP_OK) {
-        ESP_LOGE(TAG, "更新电池百分比失败: %s", esp_err_to_name(pct_err));
-        return pct_err;
+        ESP_LOGW(TAG, "更新电池百分比失败: %s（继续更新电量等级）", esp_err_to_name(pct_err));
     }
 
     // 更新 BatChargeLevel (0x000E)，类型 enum8
@@ -1617,6 +1639,24 @@ esp_err_t app_matter_bridge_find_endpoint(const char *device_sn, uint16_t *endpo
         return ESP_ERR_NOT_FOUND;
     }
     *endpoint_id = entry->endpoint_id;
+    taskEXIT_CRITICAL(&s_device_table_lock);
+    return ESP_OK;
+}
+
+esp_err_t app_matter_bridge_find_endpoints(const char *device_sn, uint16_t *endpoint_id, uint16_t *mode_ep_id)
+{
+    if (device_sn == NULL || endpoint_id == NULL || mode_ep_id == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    taskENTER_CRITICAL(&s_device_table_lock);
+    bridged_device_entry_t *entry = find_by_sn(device_sn);
+    if (entry == NULL) {
+        taskEXIT_CRITICAL(&s_device_table_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    *endpoint_id = entry->endpoint_id;
+    *mode_ep_id = entry->mode_ep_id;
     taskEXIT_CRITICAL(&s_device_table_lock);
     return ESP_OK;
 }

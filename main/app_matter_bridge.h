@@ -137,6 +137,19 @@ esp_err_t app_matter_bridge_update_reachable(uint16_t endpoint_id, bool online);
 esp_err_t app_matter_bridge_find_endpoint(const char *device_sn, uint16_t *endpoint_id);
 
 /**
+ * @brief 通过 device_sn 查找主端点 ID 和模式端点 ID
+ *
+ * 模式端点（mode_ep_id）仅 5005 系列设备有，其他设备 mode_ep_id=0。
+ * 用于网关上下线时同时更新主端点和模式端点的 Reachable 属性。
+ *
+ * @param device_sn LoRa 设备 SN
+ * @param endpoint_id [out] 主端点 ID
+ * @param mode_ep_id [out] 模式端点 ID（0=无模式端点）
+ * @return ESP_OK 成功，ESP_ERR_NOT_FOUND 设备不存在
+ */
+esp_err_t app_matter_bridge_find_endpoints(const char *device_sn, uint16_t *endpoint_id, uint16_t *mode_ep_id);
+
+/**
  * @brief 获取当前已桥接的设备数量
  */
 int app_matter_bridge_device_count(void);
