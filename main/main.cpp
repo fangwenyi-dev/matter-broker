@@ -27,6 +27,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"  // 需要 WIFI_EVENT 和 IP_EVENT 定义
+#include "esp_mac.h"   // esp_read_mac（生成基于 MAC 的唯一 bridge_sn）
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"  // 项22: system_monitor_task 喂狗
 #include "esp_ota_ops.h"   // P0: esp_ota_mark_app_valid_cancel_rollback（OTA 回滚保护）
@@ -267,8 +268,20 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Matter Bridge 已初始化");
 
     // 5. 初始化协议桥接层
+    //    bridge_sn 基于 MAC 地址生成，保证每台设备唯一：
+    //    多台设备部署在同一局域网时，MQTT client_id 和 $SH 协议主题不会冲突。
+    //    格式：MATTER_BRIDGE_<MAC后6位>，如 MATTER_BRIDGE_A1B2C3
+    char bridge_sn[32] = {0};
+    {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(bridge_sn, sizeof(bridge_sn), "MATTER_BRIDGE_%02X%02X%02X",
+                 mac[3], mac[4], mac[5]);
+    }
+    ESP_LOGI(TAG, "Bridge SN (MAC-based): %s", bridge_sn);
+
     protocol_bridge_config_t bridge_config = {
-        .bridge_sn = CONFIG_GATEWAY_SN,
+        .bridge_sn = bridge_sn,
         .mqtt_msg_queue = s_mqtt_msg_queue,
         .matter_event_queue = s_matter_event_queue,
     };
@@ -335,7 +348,7 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "=== 系统初始化完成 ===");
     ESP_LOGI(TAG, "Broker: tcp://0.0.0.0:%d", CONFIG_BROKER_PORT);
-    ESP_LOGI(TAG, "Bridge SN: %s", CONFIG_GATEWAY_SN);
+    ESP_LOGI(TAG, "Bridge SN: %s", bridge_sn);
     ESP_LOGI(TAG, "按键: 2击=LoRa配对, 3击=删除所有子设备, 5击=重置Matter, 长按5s=重置WiFi");
     ESP_LOGI(TAG, "等待 LoRa 网关上线（自动绑定 + 发现设备）");
     ESP_LOGI(TAG, "使用 Apple Home / Google Home 扫描配网二维码进行配对");
