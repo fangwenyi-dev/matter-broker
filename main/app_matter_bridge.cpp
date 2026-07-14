@@ -1319,14 +1319,20 @@ int app_matter_bridge_remove_all_devices(void)
     }
 
     // 4. 清空整个 s_device_table（不需要 StackLock）
+    // 注意：ESP_LOG 不能在 taskENTER_CRITICAL 临界区内调用，
+    // newlib 的 log lock 在临界区内获取会触发 lock_acquire_generic 的 abort() 检测。
+    int cleaned_count = 0;
     taskENTER_CRITICAL(&s_device_table_lock);
     for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
         if (s_device_table[i].in_use) {
-            ESP_LOGI(TAG, "remove_all: 清理设备表项 sn=%s", s_device_table[i].device_sn);
             clear_device_entry(&s_device_table[i]);
+            cleaned_count++;
         }
     }
     taskEXIT_CRITICAL(&s_device_table_lock);
+    if (cleaned_count > 0) {
+        ESP_LOGI(TAG, "remove_all: 清理了 %d 个设备表项", cleaned_count);
+    }
 
     // 5. 关键：无论是否销毁了端点，都主动通知 PartsList 变更
     //    场景：重启后 esp_matter 内存中没有桥接端点（动态端点不持久化），
