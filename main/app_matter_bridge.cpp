@@ -582,7 +582,7 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
                 ESP_LOGI(TAG, "CASE Session 建立（<30s 内重复，跳过通知）");
                 break;
             }
-            ESP_LOGI(TAG, "Matter CASE Session 建立，通知 PartsList + Reachable");
+            ESP_LOGI(TAG, "Matter CASE Session 建立，通知 PartsList");
 
             // 通知 aggregator 的 PartsList 变更（触发控制器重新发现端点）
             if (s_aggregator_endpoint_id != 0) {
@@ -590,31 +590,22 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
                     s_aggregator_endpoint_id, DESCRIPTOR_CLUSTER_ID, DESCRIPTOR_ATTR_PARTS_LIST);
             }
 
-            // P-Speed1 回退：恢复 CASE Session 中的批量 Reachable 通知。
-            // 原优化移除此通知，但当 HomeKit 重连后订阅被拆除时，
-            // 它无法获取端点 Reachable 状态，导致不读取端点属性
-            // （WindowCovering 滑块 + PowerSource 电池均不显示）。
-            // Reachable 通知触发 HomeKit 重新读取端点属性，恢复滑块和电池显示。
-            // 报文大小风险：仅通知 Reachable 属性（bool=1字节），
-            // 比完整属性报告小得多，不会导致 ReportData 过大。
-            taskENTER_CRITICAL(&s_device_table_lock);
-            for (int i = 0; i < MAX_BRIDGED_DEVICES; i++) {
-                if (s_device_table[i].in_use) {
-                    uint16_t ep = s_device_table[i].endpoint_id;
-                    uint16_t mode_ep = s_device_table[i].mode_ep_id;
-                    taskEXIT_CRITICAL(&s_device_table_lock);
-                    MatterReportingAttributeChangeCallback(
-                        ep, BridgedDeviceBasicInformation::Id,
-                        BridgedDeviceBasicInformation::Attributes::Reachable::Id);
-                    if (mode_ep != 0) {
-                        MatterReportingAttributeChangeCallback(
-                            mode_ep, BridgedDeviceBasicInformation::Id,
-                            BridgedDeviceBasicInformation::Attributes::Reachable::Id);
-                    }
-                    taskENTER_CRITICAL(&s_device_table_lock);
-                }
-            }
-            taskEXIT_CRITICAL(&s_device_table_lock);
+            // P-ReportData1 修复：移除 CASE Session 中的批量 Reachable 通知。
+            //
+            // 原代码在 CASE Session 建立时批量通知所有端点的 Reachable 属性，
+            // 叠加 HomeKit 自身订阅请求的属性读取，导致首次订阅 ReportData
+            // 超过 1000 字节（实测 4 条 ~1200 字节），HomeKit 拆除订阅
+            // （status 0x7d = InvalidSubscription），配网后"正在更新"时间延长。
+            //
+            // 移除原因：
+            // 1. PartsList 通知已足够触发 HomeKit 发现端点并读取属性
+            // 2. Reachable 属性值已正确存储在 attribute store 中（update_reachable 设置）
+            // 3. HomeKit 读取端点时自动获取 Reachable 值，无需额外通知
+            // 4. 减少 dirty 属性数量，降低首次订阅 ReportData 大小
+            //
+            // 原 P-Speed1 回退的原因（HomeKit 重连后不读取属性）实际由
+            // 订阅被拆除引起——拆除后 HomeKit 无活跃订阅，无法接收通知。
+            // 修复 ReportData 超限后订阅不再被拆除，HomeKit 正常读取属性。
         }
         break;
     }
