@@ -789,22 +789,21 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
     // 2.1 补全 WindowCovering 缺失的 Matter 规范强制属性
     //     esp_matter SDK 的 feature::position_aware_lift::add() 仅创建了
     //     TargetPositionLiftPercent100ths 和 CurrentPositionLiftPercent100ths，
-    //     漏掉了以下 5 个强制属性。HomeKit 读取这些属性时返回 UnsupportedAttribute，
-    //     导致滑块不渲染且添加设备时卡住。
+    //     漏掉了 PositionAwareLift feature 的 2 个强制属性。
+    //     HomeKit 读取这些属性时返回 UnsupportedAttribute，导致滑块不渲染。
+    //
+    //     P-ReportData2 优化：移除 3 个非强制属性（NumberOfActuationsLift、
+    //     CurrentPositionLiftPercentage、CurrentPositionLift），减少首次订阅
+    //     ReportData 数据量约 60-90 字节，缩短 HomeKit "正在更新"时间。
+    //     - NumberOfActuationsLift: 执行次数计数器，HomeKit 不渲染
+    //     - CurrentPositionLiftPercentage: 已有 Percent100ths，Percentage 冗余
+    //     - CurrentPositionLift: 绝对位置，HomeKit 不直接渲染
     {
         cluster_t *wc_cluster = cluster::get(endpoint, WindowCovering::Id);
         if (wc_cluster == NULL) {
             ESP_LOGE(TAG, "获取 WindowCovering cluster 失败，无法补全属性");
         } else {
-            // --- PositionAwareLift 缺失属性 ---
-            // NumberOfActuationsLift (0x0005): uint16, NONVOLATILE
-            cluster::window_covering::attribute::create_number_of_actuations_lift(wc_cluster, 0);
-            // CurrentPositionLiftPercentage (0x0008): nullable uint8, NONVOLATILE
-            cluster::window_covering::attribute::create_current_position_lift_percentage(
-                wc_cluster, nullable<uint8_t>(0));
-            // CurrentPositionLift (0x0003): nullable uint16
-            esp_matter::attribute::create(wc_cluster, ATTR_CURRENT_POSITION_LIFT,
-                ATTRIBUTE_FLAG_NULLABLE, esp_matter_nullable_uint16(nullable<uint16_t>(0)));
+            // --- PositionAwareLift 强制属性 ---
             // InstalledOpenLimitLift (0x0010): uint16 (全开位置=0)
             esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_OPEN_LIMIT_LIFT,
                 ATTRIBUTE_FLAG_NONE, esp_matter_uint16(0));
@@ -812,7 +811,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
             esp_matter::attribute::create(wc_cluster, ATTR_INSTALLED_CLOSED_LIMIT_LIFT,
                 ATTRIBUTE_FLAG_NONE, esp_matter_uint16(10000));
 
-            ESP_LOGI(TAG, "已补全 WindowCovering 强制属性 (5个): ep=%u", endpoint::get_id(endpoint));
+            ESP_LOGI(TAG, "已补全 WindowCovering 强制属性 (2个): ep=%u", endpoint::get_id(endpoint));
         }
     }
 
@@ -1041,16 +1040,7 @@ esp_err_t app_matter_bridge_add_device(const char *device_sn, const char *device
                  ep_id, esp_err_to_name(lift_err));
     }
 
-    // 7d. 初始化 CurrentPositionLiftPercentage（NONVOLATILE，手动创建的属性）
-    //     此属性是 Matter 规范的可选属性，HomeKit 部分版本会读取它渲染滑块位置。
-    //     不初始化会导致 data version 未建立，HomeKit 读取时报错。
-    esp_matter_attr_val_t lift_pct_val = esp_matter_nullable_uint8(nullable<uint8_t>(0));
-    esp_err_t lift_pct_err = attribute::update(ep_id, WindowCovering::Id,
-                                                ATTR_CURRENT_LIFT_PERCENTAGE, &lift_pct_val);
-    if (lift_pct_err != ESP_OK) {
-        ESP_LOGW(TAG, "初始化 CurrentPositionLiftPercentage 失败: ep=%u err=%s",
-                 ep_id, esp_err_to_name(lift_pct_err));
-    }
+    // P-ReportData2: CurrentPositionLiftPercentage 已移除，不再初始化
 
     // 7f. 验证日志：读取所有关键属性的实际值
     {
@@ -1410,18 +1400,8 @@ esp_err_t app_matter_bridge_update_position(uint16_t endpoint_id, uint8_t lora_p
         ESP_LOGW(TAG, "更新当前位置失败: %s", esp_err_to_name(current_err));
     }
 
-    // 3. 更新 CurrentPositionLiftPercentage (0x0008)
-    //    HomeKit 部分版本使用此属性（而非 Percent100ths）渲染滑块位置。
-    //    不更新会导致滑块位置与实际位置不一致。
-    //    类型：nullable uint8，范围 0-100（注意：不是 0-10000）
-    esp_matter_attr_val_t pct_val = esp_matter_nullable_uint8(nullable<uint8_t>(matter_percent));
-    esp_err_t pct_err = attribute::update(endpoint_id,
-                                           WindowCovering::Id,
-                                           ATTR_CURRENT_LIFT_PERCENTAGE,
-                                           &pct_val);
-    if (pct_err != ESP_OK) {
-        ESP_LOGW(TAG, "更新 CurrentPositionLiftPercentage 失败: %s", esp_err_to_name(pct_err));
-    }
+    // P-ReportData2: CurrentPositionLiftPercentage 已移除，不再更新
+    // HomeKit 使用 CurrentPositionLiftPercent100ths 渲染滑块位置
 
     // OperationalStatus (0x000A) 是 Matter 规范中的只读属性，由 SDK 内部管理。
     // SDK 在收到 GoToLiftPercentage 命令时会自动设置 OperationalStatus 为运动中，
